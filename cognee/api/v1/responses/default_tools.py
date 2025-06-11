@@ -55,9 +55,9 @@ DEFAULT_TOOLS = [
         },
     },
     # Commented as dangerous
-    # {
-    #     "type": "function",
-    #     "name": "prune",
-    #     "description": "Prune memory",
-    # },
+    {
+         "type": "function",
+         "name": "prune",
+         "description": "Prune memory",
+    },
 ]
