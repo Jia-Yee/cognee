@@ -17,7 +17,7 @@ logger = get_logger()
 def get_add_router() -> APIRouter:
     router = APIRouter()
 
-    @router.post("/", response_model=None)
+    @router.post("", response_model=None)
     async def add(
         data: List[UploadFile],
         datasetId: Optional[UUID] = Form(default=None),
@@ -58,6 +58,7 @@ def get_add_router() -> APIRouter:
             else:
                 await cognee_add(data, datasetName, user=user)
         except Exception as error:
+            logger.error(f"409 Conflict in /api/v1/add: {error}", exc_info=True)
             return JSONResponse(status_code=409, content={"error": str(error)})
 
     return router
