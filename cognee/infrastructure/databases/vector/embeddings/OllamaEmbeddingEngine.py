@@ -102,11 +102,14 @@ class OllamaEmbeddingEngine(EmbeddingEngine):
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
 
+        #logger.info(f"OllamaEmbeddingEngine: endpoint {self.endpoint}, payload: {payload}")
+
         async with aiohttp.ClientSession() as session:
             async with session.post(
-                self.endpoint, json=payload, headers=headers, timeout=60.0
+                self.endpoint, json=payload, headers=headers, timeout=120.0
             ) as response:
                 data = await response.json()
+                #logger.info(f"OllamaEmbeddingEngine: response data: {data}")
                 return data["embedding"]
 
     def get_vector_size(self) -> int:
