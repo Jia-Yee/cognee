@@ -29,7 +29,21 @@ from cognee.tasks.graph.models import NodeModel, GraphOntology
 from cognee.shared.data_models import KnowledgeGraph
 from cognee.modules.engine.utils import generate_node_id, generate_node_name
 
+import pytest
+import numpy as np
+
 logger = get_logger("task:infer_data_ontology")
+
+
+@pytest.fixture(autouse=True)
+def patch_embedding(monkeypatch):
+    # Patch the embedding function to always return a vector of 4096 floats
+    def dummy_embed(*args, **kwargs):
+        return [float(i) for i in range(4096)]
+    monkeypatch.setattr(
+        "cognee.infrastructure.databases.vector.lancedb.LanceDBAdapter.embed_text",
+        dummy_embed
+    )
 
 
 async def extract_ontology(content: str, response_model: Type[BaseModel]):
