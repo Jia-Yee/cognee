@@ -12,10 +12,10 @@ export default function Footer() {
           {/* <TextLogo width={92} height={24} /> */}
         </div>
         <div className={styles.rightSide}>
-          <Link target="_blank" href="https://github.com/topoteretes/cognee">
+          <Link target="_blank" href="https://github.com/Jia-Yee/cognee">
             <GithubIcon color="white" />
           </Link>
-          <Link target="_blank" href="https://discord.gg/m63hxKsp4p">
+          <Link target="_blank" href="https://discord.gg/tianwailaiwu">
             <DiscordIcon color="white" />
           </Link>
         </div>
