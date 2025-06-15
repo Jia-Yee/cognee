@@ -4,11 +4,14 @@ from cognee.modules.users.models import User
 from cognee.modules.search.types import SearchType
 from cognee.modules.users.methods import get_default_user
 from cognee.modules.search.methods import search as search_function
+from cognee.modules.retrieval.function_calling_completion_retriever import FunctionCallingCompletionRetriever
 
+# Add new search type as a string constant
+FUNCTION_CALLING_COMPLETION = "FUNCTION_CALLING_COMPLETION"
 
 async def search(
     query_text: str,
-    query_type: SearchType = SearchType.GRAPH_COMPLETION,
+    query_type: SearchType = SearchType.RAG_COMPLETION,
     user: User = None,
     datasets: Union[list[str], str, None] = None,
     system_prompt_path: str = "answer_simple_question.txt",

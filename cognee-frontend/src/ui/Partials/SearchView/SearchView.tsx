@@ -39,6 +39,9 @@ export default function SearchView() {
   }, {
     value: 'GRAPH_COMPLETION_CONTEXT_EXTENSION',
     label: 'Cognee\'s Multi-Hop search',
+  }, {
+    value: 'FUNCTION_CALLING_COMPLETION',
+    label: 'Function Calling Completion (Tools, Math, Entropy, etc.)',
   }];
   const [searchType, setSearchType] = useState(searchOptions[0]);
   const [rangeValue, setRangeValue] = useState(10);

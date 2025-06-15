@@ -18,12 +18,16 @@ from cognee.modules.retrieval.graph_completion_context_extension_retriever impor
 from cognee.modules.retrieval.code_retriever import CodeRetriever
 from cognee.modules.retrieval.cypher_search_retriever import CypherSearchRetriever
 from cognee.modules.retrieval.natural_language_retriever import NaturalLanguageRetriever
+from cognee.modules.retrieval.function_calling_completion_retriever import FunctionCallingCompletionRetriever
 from cognee.modules.search.types import SearchType
 from cognee.modules.storage.utils import JSONEncoder
 from cognee.modules.users.models import User
 from cognee.modules.users.permissions.methods import get_document_ids_for_user
 from cognee.shared.utils import send_telemetry
 from cognee.modules.search.operations import log_query, log_result
+from cognee.shared.logging_utils import get_logger
+
+logger = get_logger()
 
 
 async def search(
@@ -36,6 +40,7 @@ async def search(
     node_type: Optional[Type] = None,
     node_name: Optional[List[str]] = None,
 ):
+    logger.info(f"Search type: {query_type}")
     query = await log_query(query_text, query_type.value, user.id)
 
     own_document_ids = await get_document_ids_for_user(user.id, datasets)
@@ -106,6 +111,9 @@ async def specific_search(
         SearchType.CODE: CodeRetriever(top_k=top_k).get_completion,
         SearchType.CYPHER: CypherSearchRetriever().get_completion,
         SearchType.NATURAL_LANGUAGE: NaturalLanguageRetriever().get_completion,
+        SearchType.FUNCTION_CALLING_COMPLETION: FunctionCallingCompletionRetriever(
+            system_prompt_path=system_prompt_path, top_k=top_k
+        ).get_completion,
     }
 
     search_task = search_tasks.get(query_type)
