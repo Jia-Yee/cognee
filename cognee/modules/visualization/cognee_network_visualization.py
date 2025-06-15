@@ -187,7 +187,7 @@ async def cognee_network_visualization(graph_data, destination_file_path: str = 
                 fill="#fff"
                 font-family='"Noto Sans SC", "Microsoft YaHei", "PingFang SC", "Heiti SC", "WenQuanYi Micro Hei", sans-serif'
             >
-                天外来物
+            国传智能    
             </text>
         </svg>
     </body>
