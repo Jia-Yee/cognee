@@ -18,6 +18,7 @@ class LLMProvider(Enum):
     - ANTHROPIC: Represents the Anthropic provider.
     - CUSTOM: Represents a custom provider option.
     - GEMINI: Represents the Gemini provider.
+    - DEEPSEEK: Represents the DeepSeek provider.
     """
 
     OPENAI = "openai"
@@ -25,6 +26,7 @@ class LLMProvider(Enum):
     ANTHROPIC = "anthropic"
     CUSTOM = "custom"
     GEMINI = "gemini"
+    DEEPSEEK = "deepseek"
 
 
 def get_llm_client():
@@ -70,6 +72,23 @@ def get_llm_client():
             max_tokens=max_tokens,
             streaming=llm_config.llm_streaming,
         )
+    
+    elif provider == LLMProvider.DEEPSEEK:
+        if llm_config.llm_api_key is None:
+            raise InvalidValueError(message="LLM API key is not set.")
+
+        from .deepseek.adapter import DeepSeekAdapter
+
+        return DeepSeekAdapter(
+            api_key=llm_config.llm_api_key,
+            endpoint=llm_config.llm_endpoint,
+            api_version=llm_config.llm_api_version,
+            model=llm_config.llm_model,
+            transcription_model=llm_config.transcription_model,
+            max_tokens=max_tokens,
+            streaming=llm_config.llm_streaming, # Assuming DeepSeek supports streaming 
+        )
+
 
     elif provider == LLMProvider.OLLAMA:
         if llm_config.llm_api_key is None:

@@ -1,15 +1,60 @@
+import logging
 from typing import Any, Optional
 
 from cognee.infrastructure.databases.vector import get_vector_engine
 from cognee.modules.retrieval.base_retriever import BaseRetriever
 from cognee.modules.retrieval.exceptions.exceptions import NoDataError
 from cognee.infrastructure.databases.vector.exceptions import CollectionNotFoundError
+from cognee.infrastructure.llm.get_llm_client import get_llm_client  # Make sure this import is correct
+from cognee.modules.retrieval.utils.completion import generate_completion, generate_completion_with_function_calling
+from cognee.infrastructure.llm.prompts import render_prompt
 
 import numpy as np
 import pandas as pd
 import re
 import ast
 import json
+
+logger = logging.getLogger(__name__)
+
+tools = [
+    {
+        "type": "function",
+        "function": {
+            "name": "add",
+            "description": "Sum a list of numbers. Example: add([1,2,3]) returns 6.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "data": {
+                        "type": "array",
+                        "items": {"type": "number"},
+                        "description": "Numbers to sum"
+                    }
+                },
+                "required": ["data"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "entropy_weight",
+            "description": "Calculate entropy-based weights for a matrix of data.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "data": {
+                        "type": "array",
+                        "items": {"type": "array", "items": {"type": "number"}},
+                        "description": "Matrix of numbers"
+                    }
+                },
+                "required": ["data"]
+            }
+        }
+    }
+]
 
 # Function registry for user-defined tools
 function_registry = {}
@@ -52,128 +97,77 @@ def add(data):
 
 async def call_llm_to_decide_function(query: str, context: str, available_functions: list) -> dict:
     """
-    Call the LLM to decide which function to use and extract parameters.
+    Call the LLM (via generate_completion) to decide which function to use and extract parameters.
     Returns a dict: {"function": function_name, "parameters": ...}
     """
-    # Prepare function descriptions
-    function_descriptions = {
-        "add": "add(data): Sum a list of numbers. Example: add([1,2,3]) returns 6.",
-        "entropy_weight": (
-            "entropy_weight(data): Calculate entropy-based weights for a matrix of data. "
-            "Input is a list of lists (rows: samples, columns: features). "
-            "Example: entropy_weight([[1,2,3],[4,5,6],[7,8,9]])"
-        ),
-    }
-    # Compose the prompt for the LLM
-    prompt = f"""
-You are an intelligent assistant that can decide whether to call a function (tool) to help answer a user's query.
-Here are the available functions/tools:
-{json.dumps(function_descriptions, indent=2)}
+    logger.info(f"[FunctionCalling] Deciding function for query: {query} with context: {context}")
+    llm_response = await generate_completion_with_function_calling(
+        query=query,
+        context=context,
+        user_prompt_path="function_call_decision.txt",
+        system_prompt_path="function_call_decision_system.txt",
+        tools=tools,
+    )
 
-Given the following user query and context, decide if a function call is needed.
-If so, return a JSON object with the function name and parameters to use.
-If not, return: {{"function": null, "parameters": null}}
-
-User query: {query}
-
-Context:
-{context}
-
-Respond ONLY with a JSON object, e.g.:
-{{"function": "add", "parameters": [1,2,3]}}
-or
-{{"function": "entropy_weight", "parameters": [[1,2,3],[4,5,6],[7,8,9]]}}
-or
-{{"function": null, "parameters": null}}
-"""
-
-    # --- Replace with your actual LLM call ---
-    # Example using an OpenAI-like async client:
-    # from your_llm_client import get_llm_client
-    # llm_client = get_llm_client()
-    # llm_response = await llm_client.acomplete(prompt)
-    # try:
-    #     decision = json.loads(llm_response)
-    #     return decision
-    # except Exception:
-    #     return {"function": None, "parameters": None}
-
-    # For now, fallback to mock logic if LLM is not available:
-    import re
-    import ast
-    if "add" in query:
-        match = re.search(r"add\s*\(([^)]*)\)", query)
-        if match:
-            arg_str = match.group(1)
-            try:
-                params = ast.literal_eval(arg_str)
-            except Exception:
-                params = [ast.literal_eval(a.strip()) for a in arg_str.split(',') if a.strip()]
-                if len(params) == 1:
-                    params = params[0]
-            return {"function": "add", "parameters": params}
-    if "entropy_weight" in query:
-        match = re.search(r"entropy_weight\s*\(([^)]*)\)", query)
-        if match:
-            arg_str = match.group(1)
-            try:
-                params = ast.literal_eval(arg_str)
-            except Exception:
-                params = [[int(x) for x in re.findall(r"\d+", row)] for row in arg_str.split('],[')]
-            return {"function": "entropy_weight", "parameters": params}
-        match = re.search(r"\[\[.*?\]\]", query)
-        if match:
-            try:
-                params = ast.literal_eval(match.group(0))
-                return {"function": "entropy_weight", "parameters": params}
-            except Exception:
-                pass
-
-    return {"function": None, "parameters": None}
+    logger.info(f"[FunctionCalling] LLM response for function decision: {llm_response}")
+    
+    try:
+        cleaned_response = llm_response['content'].strip("```json\n").strip("```").strip()
+        decision = json.loads(cleaned_response)
+        logger.info(f"[FunctionCalling] Parsed function decision: {decision}")
+        return decision
+    except Exception as e:
+        logger.error(f"[FunctionCalling] Failed to parse LLM response: {llm_response}, error: {e}")
+        return {"function": None, "parameters": None}
 
 async def call_llm_generate_answer(query: str, context: str) -> str:
     """
-    Call the LLM to generate a natural language answer given the query and updated context.
-    Replace this with your actual LLM call.
+    Call the LLM (via generate_completion) to generate a natural language answer.
     """
-    # Example prompt for the LLM:
-    prompt = f"""
-    Given the following context and user query, answer the question concisely and clearly.
-    Context:
-    {context}
-    User query: {query}
-    """
-    # --- Replace with your LLM call ---
-    # For demonstration, just echo a mock answer:
-    return f"[LLM Answer] Based on the context, the answer to '{query}' is: {context.splitlines()[0]}"
+    args = {"question": query, "context": context}
+    user_prompt = render_prompt("function_call_answer.txt", args)
+    answer = await generate_completion(
+        query=user_prompt,
+        context="",
+        user_prompt_path="function_call_answer.txt",
+        system_prompt_path="function_call_answer_system.txt",
+    )
+    logger.info(f"[FunctionCalling] LLM answer: {answer}")
+    return answer
 
 async def generate_function_calling_completion(query: str, context: str, user_prompt_path: str, system_prompt_path: str) -> Any:
     """
     LLM-driven function calling: LLM decides which function to use and extracts parameters.
     Runs the function, updates the context with the result, and generates a final answer.
     """
+    logger.info(f"[FunctionCalling] Start function-calling completion for query: {query}")
     available_functions = list(function_registry.keys())
     llm_decision = await call_llm_to_decide_function(query, context, available_functions)
     func_name = llm_decision.get("function")
     params = llm_decision.get("parameters")
+    logger.info(f"[FunctionCalling] LLM decided function: {func_name}, params: {params}")
     if func_name and func_name in function_registry:
         func = function_registry[func_name]
         try:
-            result = func(params)
-            # Add the function result to the beginning of the context
-            result_str = f"Function call: {func_name}({params}) = {result}"
+            result = func(params["data"])
+            logger.info(f"[FunctionCalling] Function result: {result}")
+            result_str = f"一级指标权重： {func_name} = {result}"
             updated_context = result_str + "\n" + context
-            # Now call the LLM to generate the final answer
             answer = await call_llm_generate_answer(query, updated_context)
-            return f"{result_str}\nAnswer: {answer}"
+            logger.info(f"[FunctionCalling] Final answer: {answer}")
+            return f"{answer}"
         except Exception as e:
+            logger.error(f"[FunctionCalling] Function call error: {func_name}({params}) - {e}")
             return f"Function call error: {func_name}({params}) - {e}"
-    # Otherwise, fallback to normal completion
+    logger.info(f"[FunctionCalling] No function called, fallback to normal completion.")
     return f"LLM completion: {query} | Context: {context}"
 
 class FunctionCallingCompletionRetriever(BaseRetriever):
     """
-    Retriever for LLM-based completion with function calling (add tool).
+    Retriever for LLM-based completion with function calling (add tool, entropy_weight, etc).
+    Public methods:
+    - get_context(query: str) -> str
+    - get_completion(query: str, context: Optional[Any] = None) -> Any
     """
     def __init__(
         self,
@@ -186,6 +180,9 @@ class FunctionCallingCompletionRetriever(BaseRetriever):
         self.top_k = top_k if top_k is not None else 1
 
     async def get_context(self, query: str) -> str:
+        """
+        Retrieves relevant document chunks as context (same as CompletionRetriever).
+        """
         vector_engine = get_vector_engine()
         try:
             found_chunks = await vector_engine.search("DocumentChunk_text", query, limit=self.top_k)
@@ -197,6 +194,9 @@ class FunctionCallingCompletionRetriever(BaseRetriever):
             raise NoDataError("No data found in the system, please add data first.") from error
 
     async def get_completion(self, query: str, context: Optional[Any] = None) -> Any:
+        """
+        Generates a function-calling LLM completion using the context.
+        """
         if context is None:
             context = await self.get_context(query)
         completion = await generate_function_calling_completion(
