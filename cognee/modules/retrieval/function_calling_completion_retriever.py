@@ -53,7 +53,55 @@ tools = [
                 "required": ["data"]
             }
         }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "calculate_city_score",
+            "description": "Calculate the international communication influence score for cities based on indicators.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "indicator_data": {
+                        "type": "array",
+                        "items": {"type": "array", "items": {"type": "number"}},
+                        "description": "Matrix of city indicators"
+                    }
+                },
+                "required": ["indicator_data"]
+            }
+        }
     }
+]
+
+level_1_tags = [
+    "网络传播影响力",
+    "媒体报道影响力",
+    "社交媒体影响力",
+    "搜索引擎影响力",
+    "国际访客影响力",
+]
+
+weights_dict = {
+    "网络传播":0.1523,
+    # 网络传播影响力 (官方社交媒体)
+    "媒体报道":0.183,
+    # 媒体报道影响力 (国内外文报道-国内)
+    "社交媒体":0.1796,
+    # 社交媒体影响力 (Facebook关键词词频)
+    "搜索引擎":0.2152,
+    # 搜索引擎影响力
+    "国际访客": 0.2699,
+    # 国际访客影响力
+}
+
+
+level_1_keys = [
+    "网络传播",
+    "媒体报道",
+    "社交媒体",
+    "搜索引擎",
+    "国际访客",
 ]
 
 # Function registry for user-defined tools
@@ -86,7 +134,36 @@ def entropy_weight(data):
     # 4. 计算权重
     d = 1 - entropy
     weights = np.round(d / d.sum(), 4)
-    return weights.values.tolist(), entropy.values.tolist()
+    return weights.values.tolist()
+
+@register_function("calculate_city_score")
+def calculate_city_score(indicator_data):
+    """
+    计算城市国际传播影响力得分
+    :param indicator_data: DataFrame, 行是城市，列是底层指标
+    :return: 最终得分数组 (0-100范围)
+    """
+    if not isinstance(indicator_data, pd.DataFrame):
+        indicator_data = pd.DataFrame(indicator_data)
+        indicator_data.columns = level_1_keys  # Ensure columns match level_1_tags
+    # 1. 对每个底层指标进行min-max标准化
+    normalized_indicators = (indicator_data - indicator_data.min()) / (
+        indicator_data.max() - indicator_data.min() + 1e-8)
+    
+    # 2. 计算加权原始总分
+    weighted_scores = []
+    for col in normalized_indicators.columns:
+        if col in weights_dict:
+            weighted_scores.append(normalized_indicators[col] * weights_dict[col])
+    
+    total_scores = pd.concat(weighted_scores, axis=1).sum(axis=1)
+    
+    # 3. 对原始总分进行min-max标准化得到最终得分
+    final_scores = (total_scores - total_scores.min()) / (
+        total_scores.max() - total_scores.min() )
+    final_scores_percent = np.round(final_scores * 100, 2)
+    return final_scores_percent.values
+
 
 @register_function("add")
 def add(data):
@@ -133,6 +210,8 @@ async def call_llm_generate_answer(query: str, context: str) -> str:
         system_prompt_path="function_call_answer_system.txt",
     )
     logger.info(f"[FunctionCalling] LLM answer: {answer}")
+    if isinstance(answer, dict) and "content" in answer:
+        answer = answer["content"]
     return answer
 
 async def generate_function_calling_completion(query: str, context: str, user_prompt_path: str, system_prompt_path: str) -> Any:
@@ -149,9 +228,24 @@ async def generate_function_calling_completion(query: str, context: str, user_pr
     if func_name and func_name in function_registry:
         func = function_registry[func_name]
         try:
-            result = func(params["data"])
-            logger.info(f"[FunctionCalling] Function result: {result}")
-            result_str = f"一级指标权重： {func_name} = {result}"
+            
+            if func_name == "entropy_weight":
+                result = func(params["data"])
+                logger.info(f"[FunctionCalling] Function result: {result}")
+                if len(level_1_tags) != len(result):
+                    result_str = f"一级指标权重： {func_name} = {result}"
+                else:
+                    result_str = f"一级指标权重：{dict(zip(level_1_tags, result))}"
+            elif func_name == "calculate_city_score":
+                result = func(params["indicator_data"])
+                logger.info(f"[FunctionCalling] Function result: {result}")
+                if len(llm_decision['city_list']) != len(result):
+                    result_str = f"城市国际传播影响力得分: {llm_decision['city_list']} {result}"
+                else:
+                    result_str = f"城市国际传播影响力得分：{dict(zip(llm_decision['city_list'], result))}"
+            else:
+                result_str = f"result: {result}"
+            logger.info(f"[FunctionCalling] Result string: {result_str}")
             updated_context = result_str + "\n" + context
             answer = await call_llm_generate_answer(query, updated_context)
             logger.info(f"[FunctionCalling] Final answer: {answer}")

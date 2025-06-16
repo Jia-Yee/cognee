@@ -1,4 +1,4 @@
-Given the following context and user query, answer the question concisely and clearly.
+Given the following context and user query, answer the question concisely and clearly.请用中文回答。
 Context:
 {{ context }}
 User query: {{ question }}
