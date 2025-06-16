@@ -17,7 +17,7 @@ export default function TextLogo({ width = 158, height = 44, color = 'currentCol
         fill={color}
         fontFamily='"Dancing Script", cursive'
       >
-        天外来物
+        国传智能
       </text>
     </svg>
   );
