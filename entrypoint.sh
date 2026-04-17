@@ -4,29 +4,37 @@ set -e  # Exit on error
 echo "Debug mode: $DEBUG"
 echo "Environment: $ENVIRONMENT"
 
+# Set default ports and bind address if not specified
+DEBUG_PORT=${DEBUG_PORT:-5678}
+HTTP_PORT=${HTTP_PORT:-8000}
+BIND_ADDRESS=${BIND_ADDRESS:-"0.0.0.0"}
+echo "Debug port: $DEBUG_PORT"
+echo "HTTP port: $HTTP_PORT"
+echo "Bind address: $BIND_ADDRESS"
+
 # Run Alembic migrations with proper error handling.
-# Note on UserAlreadyExists error handling:
-# During database migrations, we attempt to create a default user. If this user
-# already exists (e.g., from a previous deployment or migration), it's not a
-# critical error and shouldn't prevent the application from starting. This is
-# different from other migration errors which could indicate database schema
-# inconsistencies and should cause the startup to fail. This check allows for
-# smooth redeployments and container restarts while maintaining data integrity.
 echo "Running database migrations..."
 
-MIGRATION_OUTPUT=$(alembic upgrade head)
+# Move to the cognee directory to run alembic migrations from there
+set +e # Disable exit on error to handle specific migration errors
+MIGRATION_OUTPUT=$(cd cognee && alembic upgrade head)
 MIGRATION_EXIT_CODE=$?
+set -e
 
 if [[ $MIGRATION_EXIT_CODE -ne 0 ]]; then
-    if [[ "$MIGRATION_OUTPUT" == *"UserAlreadyExists"* ]] || [[ "$MIGRATION_OUTPUT" == *"User default_user@example.com already exists"* ]]; then
-        echo "Warning: Default user already exists, continuing startup..."
-    else
-        echo "Migration failed with unexpected error."
+    echo "Migration failed with unexpected error. Trying to run Cognee without migrations."
+
+    echo "Initializing database tables..."
+    python /app/cognee/modules/engine/operations/setup.py
+    INIT_EXIT_CODE=$?
+
+    if [[ $INIT_EXIT_CODE -ne 0 ]]; then
+        echo "Database initialization failed!"
         exit 1
     fi
+else
+    echo "Database migrations done."
 fi
-
-echo "Database migrations done."
 
 echo "Starting server..."
 
@@ -37,10 +45,10 @@ sleep 2
 if [ "$ENVIRONMENT" = "dev" ] || [ "$ENVIRONMENT" = "local" ]; then
     if [ "$DEBUG" = "true" ]; then
         echo "Waiting for the debugger to attach..."
-        debugpy --wait-for-client --listen 0.0.0.0:5678 -m gunicorn -w 3 -k uvicorn.workers.UvicornWorker -t 30000 --bind=0.0.0.0:8000 --log-level debug --reload cognee.api.client:app
+        exec debugpy --wait-for-client --listen $BIND_ADDRESS:$DEBUG_PORT -m gunicorn -w 1 -k uvicorn.workers.UvicornWorker -t 30000 --bind=$BIND_ADDRESS:$HTTP_PORT --log-level debug --reload --access-logfile - --error-logfile - cognee.api.client:app
     else
-        gunicorn -w 3 -k uvicorn.workers.UvicornWorker -t 30000 --bind=0.0.0.0:8000 --log-level debug --reload cognee.api.client:app
+        exec gunicorn -w 1 -k uvicorn.workers.UvicornWorker -t 30000 --bind=$BIND_ADDRESS:$HTTP_PORT --log-level debug --reload --access-logfile - --error-logfile - cognee.api.client:app
     fi
 else
-    gunicorn -w 3 -k uvicorn.workers.UvicornWorker -t 30000 --bind=0.0.0.0:8000 --log-level error cognee.api.client:app
+    exec gunicorn -w 1 -k uvicorn.workers.UvicornWorker -t 30000 --bind=$BIND_ADDRESS:$HTTP_PORT --log-level error --access-logfile - --error-logfile - cognee.api.client:app
 fi

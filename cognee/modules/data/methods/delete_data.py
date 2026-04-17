@@ -1,9 +1,11 @@
-from cognee.exceptions import InvalidAttributeError
+from uuid import UUID
+
+from cognee.modules.data.exceptions.exceptions import InvalidTableAttributeError
 from cognee.modules.data.models import Data
 from cognee.infrastructure.databases.relational import get_relational_engine
 
 
-async def delete_data(data: Data):
+async def delete_data(data: Data, dataset_id: UUID):
     """Delete a data record from the database.
 
     Args:
@@ -13,10 +15,8 @@ async def delete_data(data: Data):
         ValueError: If the data object is invalid.
     """
     if not hasattr(data, "__tablename__"):
-        raise InvalidAttributeError(
-            message="The provided data object is missing the required '__tablename__' attribute."
-        )
+        raise InvalidTableAttributeError()
 
     db_engine = get_relational_engine()
 
-    return await db_engine.delete_data_entity(data.id)
+    return await db_engine.delete_data_entity(data.id, dataset_id)

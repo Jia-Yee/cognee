@@ -15,6 +15,8 @@ class ModelName(Enum):
     ollama = "ollama"
     anthropic = "anthropic"
     gemini = "gemini"
+    mistral = "mistral"
+    bedrock = "bedrock"
 
 
 class LLMConfig(BaseModel):
@@ -44,14 +46,6 @@ def get_settings() -> SettingsDict:
 
     vector_dbs = [
         {
-            "value": "weaviate",
-            "label": "Weaviate",
-        },
-        {
-            "value": "qdrant",
-            "label": "Qdrant",
-        },
-        {
             "value": "lancedb",
             "label": "LanceDB",
         },
@@ -80,6 +74,14 @@ def get_settings() -> SettingsDict:
             "value": "gemini",
             "label": "Gemini",
         },
+        {
+            "value": "mistral",
+            "label": "Mistral",
+        },
+        {
+            "value": "bedrock",
+            "label": "Bedrock",
+        },
     ]
 
     return SettingsDict.model_validate(
@@ -96,8 +98,8 @@ def get_settings() -> SettingsDict:
                 "models": {
                     "openai": [
                         {
-                            "value": "gpt-4o-mini",
-                            "label": "gpt-4o-mini",
+                            "value": "gpt-5-mini",
+                            "label": "gpt-5-mini",
                         },
                         {
                             "value": "gpt-4o",
@@ -140,6 +142,38 @@ def get_settings() -> SettingsDict:
                         {
                             "value": "gemini-2.0-flash-exp",
                             "label": "Gemini 2.0 Flash",
+                        },
+                    ],
+                    "mistral": [
+                        {
+                            "value": "mistral-medium-2508",
+                            "label": "Mistral Medium 3.1",
+                        },
+                        {
+                            "value": "magistral-medium-2509",
+                            "label": "Magistral Medium 1.2",
+                        },
+                        {
+                            "value": "magistral-medium-2507",
+                            "label": "Magistral Medium 1.1",
+                        },
+                        {
+                            "value": "mistral-large-2411",
+                            "label": "Mistral Large 2.1",
+                        },
+                    ],
+                    "bedrock": [
+                        {
+                            "value": "eu.anthropic.claude-sonnet-4-5-20250929-v1:0",
+                            "label": "Claude 4.5 Sonnet",
+                        },
+                        {
+                            "value": "eu.anthropic.claude-haiku-4-5-20251001-v1:0",
+                            "label": "Claude 4.5 Haiku",
+                        },
+                        {
+                            "value": "eu.amazon.nova-lite-v1:0",
+                            "label": "Amazon Nova Lite",
                         },
                     ],
                 },

@@ -18,9 +18,16 @@ class EmbeddingConfig(BaseSettings):
     embedding_endpoint: Optional[str] = None
     embedding_api_key: Optional[str] = None
     embedding_api_version: Optional[str] = None
-    embedding_max_tokens: Optional[int] = 8191
+    embedding_max_completion_tokens: Optional[int] = 8191
+    embedding_batch_size: Optional[int] = None
     huggingface_tokenizer: Optional[str] = None
     model_config = SettingsConfigDict(env_file=".env", extra="allow")
+
+    def model_post_init(self, __context) -> None:
+        if not self.embedding_batch_size and self.embedding_provider.lower() == "openai":
+            self.embedding_batch_size = 36
+        elif not self.embedding_batch_size:
+            self.embedding_batch_size = 36
 
     def to_dict(self) -> dict:
         """
@@ -38,7 +45,7 @@ class EmbeddingConfig(BaseSettings):
             "embedding_endpoint": self.embedding_endpoint,
             "embedding_api_key": self.embedding_api_key,
             "embedding_api_version": self.embedding_api_version,
-            "embedding_max_tokens": self.embedding_max_tokens,
+            "embedding_max_completion_tokens": self.embedding_max_completion_tokens,
             "huggingface_tokenizer": self.huggingface_tokenizer,
         }
 

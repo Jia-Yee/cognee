@@ -7,11 +7,11 @@ on:
         description: "Location of Jupyter notebook to run"
         required: true
         type: string
+      ci-image:
+        required: false
+        type: string
+        default: ''
     secrets:
-      GRAPHISTRY_USERNAME:
-        required: true
-      GRAPHISTRY_PASSWORD:
-        required: true
       #LLM_MODEL:
       #  required: true
       #LLM_ENDPOINT:
@@ -39,6 +39,7 @@ jobs:
   run_notebook_test:
     name: test
     runs-on: ubuntu-22.04
+    container: ${{ inputs.ci-image != '' && fromJSON(format('{{"image":"{0}","credentials":{{"username":"{1}","password":"{2}"}}}}', inputs.ci-image, github.actor, github.token)) || null }}
     defaults:
       run:
         shell: bash
@@ -50,10 +51,7 @@ jobs:
         uses: ./.github/actions/cognee_setup
         with:
           python-version: ${{ inputs.python-version }}
-
-      - name: Install specific db dependency
-        run: |
-          poetry install -E notebook
+          extra-dependencies: "notebook"
 
       - name: Execute Jupyter Notebook
         env:
@@ -63,14 +61,13 @@ jobs:
           LLM_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }} # Use OpenAI Until a multimedia model is deployed and DeepEval support for other models is added
           #LLM_API_VERSION: ${{ secrets.LLM_API_VERSION }}
+          EMBEDDING_DIMENSIONS: 300
           EMBEDDING_MODEL: ${{ secrets.EMBEDDING_MODEL }}
           EMBEDDING_ENDPOINT: ${{ secrets.EMBEDDING_ENDPOINT }}
           EMBEDDING_API_KEY: ${{ secrets.EMBEDDING_API_KEY }}
           EMBEDDING_API_VERSION: ${{ secrets.EMBEDDING_API_VERSION }}
-          GRAPHISTRY_USERNAME: ${{ secrets.GRAPHISTRY_USERNAME }}
-          GRAPHISTRY_PASSWORD: ${{ secrets.GRAPHISTRY_PASSWORD }}
         run: |
-          poetry run jupyter nbconvert \
+          uv run jupyter nbconvert \
           --to notebook \
           --execute ${{ inputs.notebook-location }} \
           --output executed_notebook.ipynb \

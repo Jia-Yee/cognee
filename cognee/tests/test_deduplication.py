@@ -2,6 +2,7 @@ import hashlib
 import os
 from cognee.shared.logging_utils import get_logger
 import pathlib
+import pytest
 
 import cognee
 from cognee.infrastructure.databases.relational import get_relational_engine
@@ -25,8 +26,8 @@ async def test_deduplication():
     explanation_file_path2 = os.path.join(
         pathlib.Path(__file__).parent, "test_data/Natural_language_processing_copy.txt"
     )
-    await cognee.add([explanation_file_path], dataset_name)
-    await cognee.add([explanation_file_path2], dataset_name2)
+    await cognee.add([explanation_file_path], dataset_name, incremental_loading=False)
+    await cognee.add([explanation_file_path2], dataset_name2, incremental_loading=False)
 
     result = await relational_engine.get_all_data_from_table("data")
     assert len(result) == 1, "More than one data entity was found."
@@ -101,14 +102,18 @@ async def test_deduplication():
     await cognee.prune.prune_system(metadata=True)
 
 
+@pytest.mark.asyncio
 async def test_deduplication_postgres():
+    # Disable backend access control to avoid dataset handler mismatch
+    os.environ["ENABLE_BACKEND_ACCESS_CONTROL"] = "False"
+
     cognee.config.set_vector_db_config(
         {"vector_db_url": "", "vector_db_key": "", "vector_db_provider": "pgvector"}
     )
     cognee.config.set_relational_db_config(
         {
             "db_name": "cognee_db",
-            "db_host": "127.0.0.1",
+            "db_host": os.environ.get("DB_HOST", "127.0.0.1"),
             "db_port": "5432",
             "db_username": "cognee",
             "db_password": "cognee",
@@ -119,6 +124,7 @@ async def test_deduplication_postgres():
     await test_deduplication()
 
 
+@pytest.mark.asyncio
 async def test_deduplication_sqlite():
     cognee.config.set_vector_db_config(
         {"vector_db_url": "", "vector_db_key": "", "vector_db_provider": "lancedb"}

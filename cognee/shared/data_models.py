@@ -4,7 +4,9 @@ from enum import Enum, auto
 from typing import Any, Dict, List, Optional, Union
 
 from pydantic import BaseModel, Field
-from cognee.infrastructure.llm.config import get_llm_config
+from cognee.infrastructure.llm.config import (
+    get_llm_config,
+)
 
 if get_llm_config().llm_provider.lower() == "gemini":
     """
@@ -43,9 +45,14 @@ else:
         """Node in a knowledge graph."""
 
         id: str
-        name: str
+        name: str = ""
         type: str
         description: str
+
+        def __init__(self, **data):
+            if not data.get("name"):
+                data["name"] = data.get("id", "")
+            super().__init__(**data)
 
     class Edge(BaseModel):
         """Edge in a knowledge graph."""
@@ -286,7 +293,6 @@ class SummarizedCode(BaseModel):
 class GraphDBType(Enum):
     NETWORKX = auto()
     NEO4J = auto()
-    FALKORDB = auto()
     KUZU = auto()
 
 

@@ -1,8 +1,8 @@
 from typing import List, Tuple
 from pydantic import BaseModel
 
-from cognee.infrastructure.llm.get_llm_client import get_llm_client
 from cognee.infrastructure.llm.prompts import render_prompt, read_query_prompt
+from cognee.infrastructure.llm.LLMGateway import LLMGateway
 from cognee.root_dir import get_absolute_path
 
 
@@ -17,7 +17,6 @@ async def extract_content_nodes_and_relationship_names(
     content: str, existing_nodes: List[str], n_rounds: int = 2
 ) -> Tuple[List[str], List[str]]:
     """Extracts node names and relationship_names from content through multiple rounds of analysis."""
-    llm_client = get_llm_client()
     all_nodes: List[str] = existing_nodes.copy()
     all_relationship_names: List[str] = []
     existing_node_set = {node.lower() for node in all_nodes}
@@ -42,7 +41,7 @@ async def extract_content_nodes_and_relationship_names(
         system_prompt = read_query_prompt(
             "extract_graph_relationship_names_prompt_system.txt", base_directory=base_directory
         )
-        response = await llm_client.acreate_structured_output(
+        response = await LLMGateway.acreate_structured_output(
             text_input=text_input,
             system_prompt=system_prompt,
             response_model=PotentialNodesAndRelationshipNames,

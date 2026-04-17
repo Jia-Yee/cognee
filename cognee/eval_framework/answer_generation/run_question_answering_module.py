@@ -5,7 +5,7 @@ from cognee.eval_framework.answer_generation.answer_generation_executor import (
     AnswerGeneratorExecutor,
     retriever_options,
 )
-from cognee.infrastructure.files.storage import LocalStorage
+from cognee.infrastructure.files.storage import get_file_storage
 from cognee.infrastructure.databases.relational.get_relational_engine import (
     get_relational_engine,
     get_relational_config,
@@ -22,7 +22,7 @@ async def create_and_insert_answers_table(questions_payload):
     relational_engine = get_relational_engine()
 
     if relational_engine.engine.dialect.name == "sqlite":
-        LocalStorage.ensure_directory_exists(relational_config.db_path)
+        await get_file_storage(relational_config.db_path).ensure_directory_exists()
 
     async with relational_engine.engine.begin() as connection:
         if len(AnswersBase.metadata.tables.keys()) > 0:
@@ -35,7 +35,7 @@ async def create_and_insert_answers_table(questions_payload):
 
 
 async def run_question_answering(
-    params: dict, system_prompt="answer_simple_question.txt", top_k: Optional[int] = None
+    params: dict, system_prompt="answer_simple_question_benchmark.txt", top_k: Optional[int] = None
 ) -> List[dict]:
     if params.get("answering_questions"):
         logger.info("Question answering started...")
@@ -48,13 +48,20 @@ async def run_question_answering(
             raise ValueError(f"Error decoding JSON from {params['questions_path']}: {e}")
 
         logger.info(f"Loaded {len(questions)} questions from {params['questions_path']}")
-        answer_generator = AnswerGeneratorExecutor()
-        answers = await answer_generator.question_answering_non_parallel(
-            questions=questions,
-            retriever=retriever_options[params["qa_engine"]](
-                system_prompt_path=system_prompt, top_k=top_k
-            ),
-        )
+
+        if params["qa_engine"] == "beam_router":
+            from cognee.eval_framework.answer_generation.beam_router import BEAMRouter
+
+            router = BEAMRouter()
+            answers = await router.answer_questions(questions)
+        else:
+            answer_generator = AnswerGeneratorExecutor()
+            answers = await answer_generator.question_answering_non_parallel(
+                questions=questions,
+                retriever=retriever_options[params["qa_engine"]](
+                    system_prompt_path=system_prompt, top_k=top_k
+                ),
+            )
         with open(params["answers_path"], "w", encoding="utf-8") as f:
             json.dump(answers, f, ensure_ascii=False, indent=4)
 

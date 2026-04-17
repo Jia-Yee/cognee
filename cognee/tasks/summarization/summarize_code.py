@@ -3,8 +3,7 @@ from typing import AsyncGenerator, Union
 from uuid import uuid5
 
 from cognee.infrastructure.engine import DataPoint
-from cognee.modules.data.extraction.extract_summary import extract_code_summary
-
+from cognee.infrastructure.llm.extraction import extract_code_summary
 from .models import CodeSummary
 
 

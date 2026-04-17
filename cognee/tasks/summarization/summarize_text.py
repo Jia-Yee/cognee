@@ -2,12 +2,18 @@ import asyncio
 from typing import Type
 from uuid import uuid5
 from pydantic import BaseModel
-from cognee.modules.data.extraction.extract_summary import extract_summary
+
+from cognee.tasks.summarization.exceptions import InvalidSummaryInputsError
 from cognee.modules.chunking.models.DocumentChunk import DocumentChunk
+from cognee.infrastructure.llm.extraction import extract_summary
 from cognee.modules.cognify.config import get_cognify_config
-from .models import TextSummary
+from cognee.tasks.summarization.models import TextSummary
 
 
+from cognee.modules.pipelines.tasks.task import task_summary
+
+
+@task_summary("Summarized {n} chunk(s)")
 async def summarize_text(
     data_chunks: list[DocumentChunk], summarization_model: Type[BaseModel] = None
 ):
@@ -34,7 +40,25 @@ async def summarize_text(
         A list of TextSummary objects, each containing the summary of a corresponding
         DocumentChunk.
     """
+
+    if not isinstance(data_chunks, list):
+        raise InvalidSummaryInputsError("data_chunks must be a list.")
+    if not all(hasattr(c, "text") for c in data_chunks):
+        raise InvalidSummaryInputsError("each DocumentChunk must have a 'text' attribute.")
+
     if len(data_chunks) == 0:
+        return data_chunks
+
+    # Skip LLM summarization for DLT row chunks — structured data
+    # doesn't benefit from text summarization.
+    from cognee.modules.data.processing.document_types import DltRowDocument
+
+    non_dlt_chunks = [
+        c for c in data_chunks if not isinstance(getattr(c, "is_part_of", None), DltRowDocument)
+    ]
+    dlt_chunks = [c for c in data_chunks if c not in non_dlt_chunks]
+
+    if not non_dlt_chunks:
         return data_chunks
 
     if summarization_model is None:
@@ -42,7 +66,7 @@ async def summarize_text(
         summarization_model = cognee_config.summarization_model
 
     chunk_summaries = await asyncio.gather(
-        *[extract_summary(chunk.text, summarization_model) for chunk in data_chunks]
+        *[extract_summary(chunk.text, summarization_model) for chunk in non_dlt_chunks]
     )
 
     summaries = [
@@ -50,8 +74,9 @@ async def summarize_text(
             id=uuid5(chunk.id, "TextSummary"),
             made_from=chunk,
             text=chunk_summaries[chunk_index].summary,
+            importance_weight=chunk.importance_weight,
         )
-        for (chunk_index, chunk) in enumerate(data_chunks)
+        for (chunk_index, chunk) in enumerate(non_dlt_chunks)
     ]
 
-    return summaries
+    return summaries + dlt_chunks

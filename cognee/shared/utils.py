@@ -1,284 +1,207 @@
 """This module contains utility functions for the cognee."""
 
-import os
-from typing import BinaryIO, Union
-
-import requests
-import hashlib
-from datetime import datetime, timezone
-import graphistry
-import networkx as nx
-import pandas as pd
-import matplotlib.pyplot as plt
+import asyncio
 import http.server
-import socketserver
-from threading import Thread
-import sys
-
-from cognee.base_config import get_base_config
-from cognee.infrastructure.databases.graph import get_graph_engine
-
-from uuid import uuid4
+import os
 import pathlib
-from cognee.shared.exceptions import IngestionError
+import socketserver
+import ssl
+from datetime import datetime, timezone
+from threading import Thread
+from typing import Any, Union
+from uuid import NAMESPACE_OID, UUID, uuid4, uuid5
+
+import aiohttp
+
+from cognee.shared.logging_utils import get_logger
+
+logger = get_logger()
 
 # Analytics Proxy Url, currently hosted by Vercel
 proxy_url = "https://test.prometh.ai"
 
-
-def get_entities(tagged_tokens):
-    import nltk
-
-    nltk.download("maxent_ne_chunker", quiet=True)
-
-    from nltk.chunk import ne_chunk
-
-    return ne_chunk(tagged_tokens)
+# Timeout for telemetry HTTP request; short to avoid blocking if proxy is unreachable
+TELEMETRY_REQUEST_TIMEOUT: int = int(os.getenv("TELEMETRY_REQUEST_TIMEOUT", "5"))
 
 
-def extract_pos_tags(sentence):
-    """Extract Part-of-Speech (POS) tags for words in a sentence."""
-    import nltk
+def create_secure_ssl_context() -> ssl.SSLContext:
+    """
+    Create a secure SSL context.
 
-    # Ensure that the necessary NLTK resources are downloaded
-    nltk.download("words", quiet=True)
-    nltk.download("punkt", quiet=True)
-    nltk.download("averaged_perceptron_tagger", quiet=True)
+    By default, use the system's certificate store.
+    If users report SSL issues, I'm keeping this open in case we need to switch to:
+        ssl.create_default_context(cafile=certifi.where())
+    """
+    return ssl.create_default_context()
 
-    from nltk.tag import pos_tag
-    from nltk.tokenize import word_tokenize
 
-    # Tokenize the sentence into words
-    tokens = word_tokenize(sentence)
+_PERSISTENT_ID_DIR = pathlib.Path.home() / ".cognee"
+_PERSISTENT_ID_FILE = _PERSISTENT_ID_DIR / ".persistent_id"
 
-    # Tag each word with its corresponding POS tag
-    pos_tags = pos_tag(tokens)
-
-    return pos_tags
+# Original anonymous ID location (project root) — kept for backward compat
+_ANON_ID_DIR = pathlib.Path(__file__).parent.parent.parent.resolve()
+_ANON_ID_FILE = _ANON_ID_DIR / ".anon_id"
 
 
 def get_anonymous_id():
-    """Creates or reads a anonymous user id"""
-    home_dir = str(pathlib.Path(pathlib.Path(__file__).parent.parent.parent.resolve()))
+    """Get or create the original anonymous ID (project-root based).
 
-    if not os.path.isdir(home_dir):
-        os.makedirs(home_dir, exist_ok=True)
-    anonymous_id_file = os.path.join(home_dir, ".anon_id")
-    if not os.path.isfile(anonymous_id_file):
-        anonymous_id = str(uuid4())
-        with open(anonymous_id_file, "w", encoding="utf-8") as f:
-            f.write(anonymous_id)
-    else:
-        with open(anonymous_id_file, "r", encoding="utf-8") as f:
-            anonymous_id = f.read()
+    Stored in the project root as .anon_id. This is the original ID
+    that existing telemetry events reference. Kept unchanged for
+    backward compatibility with historical analytics data.
+
+    Can be overridden with TRACKING_ID env var.
+    """
+    tracking_id = os.getenv("TRACKING_ID", None)
+    if tracking_id:
+        return tracking_id
+
+    try:
+        if not os.path.isdir(str(_ANON_ID_DIR)):
+            os.makedirs(str(_ANON_ID_DIR), exist_ok=True)
+        if not _ANON_ID_FILE.is_file():
+            anonymous_id = str(uuid4())
+            _ANON_ID_FILE.write_text(anonymous_id, encoding="utf-8")
+        else:
+            anonymous_id = _ANON_ID_FILE.read_text(encoding="utf-8").strip()
+    except Exception as e:
+        logger.warning("Could not create or read anonymous id file: %s", e)
+        return "unknown-anonymous-id"
     return anonymous_id
 
 
-def send_telemetry(event_name: str, user_id, additional_properties: dict = {}):
+def get_persistent_id():
+    """Get or create a persistent machine-level ID.
+
+    Stored in ~/.cognee/.persistent_id — a user-level directory that
+    survives:
+    - cognee.forget(everything=True) (data/DB deletion)
+    - pip reinstalls / virtualenv recreation
+    - git re-clones
+    - Cognee User recreation (new user_id after delete)
+
+    This is the stable identity for correlating telemetry across
+    user_id changes. The anonymous_id (project-root) may change on
+    reinstall; the persistent_id does not.
+    """
+    try:
+        if _PERSISTENT_ID_FILE.is_file():
+            return _PERSISTENT_ID_FILE.read_text(encoding="utf-8").strip()
+
+        # Seed from anonymous_id if it exists (ties the two together)
+        persistent_id = get_anonymous_id()
+        if persistent_id == "unknown-anonymous-id":
+            persistent_id = str(uuid4())
+
+        _PERSISTENT_ID_DIR.mkdir(parents=True, exist_ok=True)
+        _PERSISTENT_ID_FILE.write_text(persistent_id, encoding="utf-8")
+        return persistent_id
+    except Exception as e:
+        logger.warning("Could not create or read persistent id file: %s", e)
+        return get_anonymous_id()
+
+
+def _sanitize_nested_properties(obj: Any, property_names: list[str]) -> Any:
+    """
+    Recursively replaces any property whose key matches one of `property_names`
+    (e.g., ['url', 'path']) in a nested dict or list with a uuid5 hash
+    of its string value. Returns a new sanitized copy.
+    """
+    if isinstance(obj, dict):
+        new_obj = {}
+        for k, v in obj.items():
+            if k in property_names and isinstance(v, str):
+                new_obj[k] = str(uuid5(NAMESPACE_OID, v))
+            else:
+                new_obj[k] = _sanitize_nested_properties(v, property_names)
+        return new_obj
+    elif isinstance(obj, list):
+        return [_sanitize_nested_properties(item, property_names) for item in obj]
+    else:
+        return obj
+
+
+async def _send_telemetry_request(payload: dict) -> None:
+    """Send telemetry payload via async HTTP. Non-blocking, no threads."""
+    timeout = aiohttp.ClientTimeout(total=TELEMETRY_REQUEST_TIMEOUT)
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(proxy_url, json=payload) as response:
+                if response.status != 200:
+                    logger.debug("Telemetry proxy returned status %s", response.status)
+    except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+        logger.debug("Telemetry request failed: %s", e)
+
+
+def _get_api_key_fingerprint() -> str:
+    """Hash the last 5 chars of the LLM API key into a fingerprint.
+
+    The last 5 characters carry the real entropy — provider prefixes
+    (sk-proj-, sk-ant-, AIzaSy-) are shared across all users. Hashing
+    the tail gives a stable identity signal that works across machines
+    and reinstalls without exposing the key.
+
+    Returns empty string if no key is configured or too short.
+    """
+    import hashlib
+
+    key = os.getenv("LLM_API_KEY", "")
+    if not key or len(key) < 5:
+        return ""
+    return hashlib.sha256(key[-5:].encode()).hexdigest()[:8]
+
+
+def send_telemetry(event_name: str, user_id: Union[str, UUID], additional_properties: dict = None):
+    """Send a product telemetry event.
+
+    Three identity layers are sent with every event:
+
+    - **anonymous_id**: Original project-root ID (.anon_id). May change
+      on reinstall. Kept for backward compatibility with historical data.
+    - **persistent_id**: Stable machine-level ID (~/.cognee/.persistent_id).
+      Survives data deletion, reinstalls, user recreation. Use this to
+      correlate a single machine across all user_id changes.
+    - **user_id**: Transient Cognee User UUID from the database. Changes
+      when the user is deleted and recreated via forget(everything=True).
+    """
+    if additional_properties is None:
+        additional_properties = {}
     if os.getenv("TELEMETRY_DISABLED"):
         return
 
     env = os.getenv("ENV")
     if env in ["test", "dev"]:
         return
-
+    additional_properties = _sanitize_nested_properties(
+        obj=additional_properties, property_names=["url"]
+    )
+    anonymous_id = str(get_anonymous_id())
+    persistent_id = str(get_persistent_id())
+    api_key_hash = _get_api_key_fingerprint()
     current_time = datetime.now(timezone.utc)
     payload = {
-        "anonymous_id": str(get_anonymous_id()),
+        "anonymous_id": anonymous_id,
         "event_name": event_name,
         "user_properties": {
             "user_id": str(user_id),
+            "persistent_id": persistent_id,
+            "api_key_hash": api_key_hash,
         },
         "properties": {
             "time": current_time.strftime("%m/%d/%Y"),
             "user_id": str(user_id),
+            "anonymous_id": anonymous_id,
+            "persistent_id": persistent_id,
+            "api_key_hash": api_key_hash,
             **additional_properties,
         },
     }
 
-    response = requests.post(proxy_url, json=payload)
-
-    if response.status_code != 200:
-        print(f"Error sending telemetry through proxy: {response.status_code}")
+    loop = asyncio.get_running_loop()
+    loop.create_task(_send_telemetry_request(payload))
 
 
-def get_file_content_hash(file_obj: Union[str, BinaryIO]) -> str:
-    h = hashlib.md5()
-
-    try:
-        if isinstance(file_obj, str):
-            with open(file_obj, "rb") as file:
-                while True:
-                    # Reading is buffered, so we can read smaller chunks.
-                    chunk = file.read(h.block_size)
-                    if not chunk:
-                        break
-                    h.update(chunk)
-        else:
-            while True:
-                # Reading is buffered, so we can read smaller chunks.
-                chunk = file_obj.read(h.block_size)
-                if not chunk:
-                    break
-                h.update(chunk)
-
-        return h.hexdigest()
-    except IOError as e:
-        raise IngestionError(message=f"Failed to load data from {file}: {e}")
-
-
-def generate_color_palette(unique_layers):
-    colormap = plt.cm.get_cmap("viridis", len(unique_layers))
-    colors = [colormap(i) for i in range(len(unique_layers))]
-    hex_colors = [
-        "#%02x%02x%02x" % (int(rgb[0] * 255), int(rgb[1] * 255), int(rgb[2] * 255))
-        for rgb in colors
-    ]
-
-    return dict(zip(unique_layers, hex_colors))
-
-
-async def register_graphistry():
-    config = get_base_config()
-    graphistry.register(
-        api=3, username=config.graphistry_username, password=config.graphistry_password
-    )
-
-
-def prepare_edges(graph, source, target, edge_key):
-    edge_list = [
-        {
-            source: str(edge[0]),
-            target: str(edge[1]),
-            edge_key: str(edge[2]),
-        }
-        for edge in graph.edges(keys=True, data=True)
-    ]
-
-    return pd.DataFrame(edge_list)
-
-
-def prepare_nodes(graph, include_size=False):
-    nodes_data = []
-    for node in graph.nodes:
-        node_info = graph.nodes[node]
-
-        if not node_info:
-            continue
-
-        node_data = {
-            **node_info,
-            "id": str(node),
-            "name": node_info["name"] if "name" in node_info else str(node),
-        }
-
-        if include_size:
-            default_size = 10  # Default node size
-            larger_size = 20  # Size for nodes with specific keywords in their ID
-            keywords = ["DOCUMENT", "User"]
-            node_size = (
-                larger_size if any(keyword in str(node) for keyword in keywords) else default_size
-            )
-            node_data["size"] = node_size
-
-        nodes_data.append(node_data)
-
-    return pd.DataFrame(nodes_data)
-
-
-async def render_graph(
-    graph=None, include_nodes=True, include_color=False, include_size=False, include_labels=True
-):
-    await register_graphistry()
-
-    if not isinstance(graph, nx.MultiDiGraph):
-        graph_engine = await get_graph_engine()
-        networkx_graph = nx.MultiDiGraph()
-
-        (nodes, edges) = await graph_engine.get_graph_data()
-
-        networkx_graph.add_nodes_from(nodes)
-        networkx_graph.add_edges_from(edges)
-
-        graph = networkx_graph
-
-    edges = prepare_edges(graph, "source_node", "target_node", "relationship_name")
-    plotter = graphistry.edges(edges, "source_node", "target_node")
-    plotter = plotter.bind(edge_label="relationship_name")
-
-    if include_nodes:
-        nodes = prepare_nodes(graph, include_size=include_size)
-        plotter = plotter.nodes(nodes, "id")
-
-        if include_size:
-            plotter = plotter.bind(point_size="size")
-
-        if include_color:
-            pass
-            # unique_layers = nodes["layer_description"].unique()
-            # color_palette = generate_color_palette(unique_layers)
-            # plotter = plotter.encode_point_color("layer_description", categorical_mapping=color_palette,
-            #                                      default_mapping="silver")
-
-        if include_labels:
-            plotter = plotter.bind(point_label="name")
-
-    # Visualization
-    url = plotter.plot(render=False, as_files=True, memoize=False)
-    print(f"Graph is visualized at: {url}")
-    return url
-
-
-# def sanitize_df(df):
-#     """Replace NaNs and infinities in a DataFrame with None, making it JSON compliant."""
-#     return df.replace([np.inf, -np.inf, np.nan], None)
-
-
-async def convert_to_serializable_graph(G):
-    """
-    Convert a graph into a serializable format with stringified node and edge attributes.
-    """
-
-    (nodes, edges) = G
-
-    networkx_graph = nx.MultiDiGraph()
-    networkx_graph.add_nodes_from(nodes)
-    networkx_graph.add_edges_from(edges)
-
-    # Create a new graph to store the serializable version
-    new_G = nx.MultiDiGraph()
-
-    # Serialize nodes
-    for node, data in networkx_graph.nodes(data=True):
-        serializable_data = {k: str(v) for k, v in data.items()}
-        new_G.add_node(str(node), **serializable_data)
-
-    # Serialize edges
-    for u, v, data in networkx_graph.edges(data=True):
-        serializable_data = {k: str(v) for k, v in data.items()}
-        new_G.add_edge(str(u), str(v), **serializable_data)
-
-    return new_G
-
-
-def generate_layout_positions(G, layout_func, layout_scale):
-    """
-    Generate layout positions for the graph using the specified layout function.
-    """
-    positions = layout_func(G)
-    return {str(node): (x * layout_scale, y * layout_scale) for node, (x, y) in positions.items()}
-
-
-def assign_node_colors(G, node_attribute, palette):
-    """
-    Assign colors to nodes based on a specified attribute and a given palette.
-    """
-    unique_attrs = set(G.nodes[node].get(node_attribute, "Unknown") for node in G.nodes)
-    color_map = {attr: palette[i % len(palette)] for i, attr in enumerate(unique_attrs)}
-    return [color_map[G.nodes[node].get(node_attribute, "Unknown")] for node in G.nodes], color_map
-
-
-def embed_logo(p, layout_scale, logo_alpha, position):
+def embed_logo(p: Any, layout_scale: float, logo_alpha: float, position: str):
     """
     Embed a logo into the graph visualization as a watermark.
     """
@@ -307,20 +230,12 @@ def embed_logo(p, layout_scale, logo_alpha, position):
     )
 
 
-def graph_to_tuple(graph):
-    """
-    Converts a networkx graph to a tuple of (nodes, edges).
-
-    :param graph: A networkx graph.
-    :return: A tuple (nodes, edges).
-    """
-    nodes = list(graph.nodes(data=True))  # Get nodes with attributes
-    edges = list(graph.edges(data=True))  # Get edges with attributes
-    return (nodes, edges)
-
-
 def start_visualization_server(
-    host="0.0.0.0", port=8001, handler_class=http.server.SimpleHTTPRequestHandler
+    host: str = "0.0.0.0",
+    port: int = 8001,
+    handler_class: type[
+        http.server.SimpleHTTPRequestHandler
+    ] = http.server.SimpleHTTPRequestHandler,
 ):
     """
     Spin up a simple HTTP server in a background thread to serve files.

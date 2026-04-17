@@ -1,23 +1,29 @@
-#
-
 """Neo4j Adapter for Graph Database"""
 
 import json
-from cognee.shared.logging_utils import get_logger, ERROR
 import asyncio
-from textwrap import dedent
-from typing import Optional, Any, List, Dict, Type, Tuple
-from contextlib import asynccontextmanager
 from uuid import UUID
+from textwrap import dedent
 from neo4j import AsyncSession
 from neo4j import AsyncGraphDatabase
 from neo4j.exceptions import Neo4jError
+from contextlib import asynccontextmanager
+from typing import Optional, Any, List, Dict, Type, Tuple, Coroutine, Set
+from cognee.modules.observability import OtelStatusCode as StatusCode
 from cognee.infrastructure.engine import DataPoint
+from cognee.modules.engine.utils.generate_timestamp_datapoint import date_to_int
+from cognee.tasks.temporal_graph.models import Timestamp
+from cognee.shared.logging_utils import get_logger, ERROR
 from cognee.infrastructure.databases.graph.graph_db_interface import (
     GraphDBInterface,
-    record_graph_changes,
 )
+from cognee.infrastructure.databases.exceptions import DatabaseCredentialsError
 from cognee.modules.storage.utils import JSONEncoder
+
+from distributed.utils import override_distributed
+from distributed.tasks.queued_add_nodes import queued_add_nodes
+from distributed.tasks.queued_add_edges import queued_add_edges
+
 from .neo4j_metrics_utils import (
     get_avg_clustering,
     get_edge_density,
@@ -26,8 +32,21 @@ from .neo4j_metrics_utils import (
     get_size_of_connected_components,
     count_self_loops,
 )
+from .deadlock_retry import deadlock_retry
 
-logger = get_logger("Neo4jAdapter", level=ERROR)
+from cognee.modules.observability import new_span
+from cognee.modules.observability.tracing import (
+    COGNEE_DB_SYSTEM,
+    COGNEE_DB_QUERY,
+    COGNEE_DB_ROW_COUNT,
+    redact_secrets,
+)
+
+
+logger = get_logger("Neo4jAdapter")
+
+
+BASE_LABEL = "__Node__"
 
 
 class Neo4jAdapter(GraphDBInterface):
@@ -40,14 +59,50 @@ class Neo4jAdapter(GraphDBInterface):
     def __init__(
         self,
         graph_database_url: str,
-        graph_database_username: str,
-        graph_database_password: str,
+        graph_database_username: Optional[str] = None,
+        graph_database_password: Optional[str] = None,
+        graph_database_name: Optional[str] = None,
+        graph_database_allow_anonymous: bool = False,
         driver: Optional[Any] = None,
     ):
+        # Only use auth if both username and password are provided
+        auth = None
+
+        if graph_database_username and graph_database_password:
+            auth = (graph_database_username, graph_database_password)
+        elif graph_database_username or graph_database_password:
+            provided = "username" if graph_database_username else "password"
+            missing = "password" if graph_database_username else "username"
+            raise DatabaseCredentialsError(
+                message=(
+                    f"Neo4j credentials are incomplete: '{provided}' was provided but "
+                    f"'{missing}' is missing. Please provide both "
+                    f"GRAPH_DATABASE_USERNAME and GRAPH_DATABASE_PASSWORD, or neither."
+                ),
+            )
+        elif not graph_database_allow_anonymous:
+            raise DatabaseCredentialsError(
+                message=(
+                    "Neo4j credentials not provided. Set GRAPH_DATABASE_USERNAME and "
+                    "GRAPH_DATABASE_PASSWORD in your .env file, or configure them programmatically."
+                ),
+            )
+
+        self.graph_database_name = graph_database_name
         self.driver = driver or AsyncGraphDatabase.driver(
             graph_database_url,
-            auth=(graph_database_username, graph_database_password),
+            auth=auth,
             max_connection_lifetime=120,
+            notifications_min_severity="OFF",
+            keep_alive=True,
+        )
+
+    async def initialize(self) -> None:
+        """
+        Initializes the database: adds uniqueness constraint on id and performs indexing
+        """
+        await self.query(
+            (f"CREATE CONSTRAINT IF NOT EXISTS FOR (n:`{BASE_LABEL}`) REQUIRE n.id IS UNIQUE;")
         )
 
     @asynccontextmanager
@@ -55,9 +110,19 @@ class Neo4jAdapter(GraphDBInterface):
         """
         Get a session for database operations.
         """
-        async with self.driver.session() as session:
+        async with self.driver.session(database=self.graph_database_name) as session:
             yield session
 
+    async def is_empty(self) -> bool:
+        query = """
+        RETURN EXISTS {
+        MATCH (n)
+        } AS node_exists;
+        """
+        query_result = await self.query(query)
+        return not query_result[0]["node_exists"]
+
+    @deadlock_retry()
     async def query(
         self,
         query: str,
@@ -79,14 +144,21 @@ class Neo4jAdapter(GraphDBInterface):
             - List[Dict[str, Any]]: A list of dictionaries representing the result of the query
               execution.
         """
-        try:
-            async with self.get_session() as session:
-                result = await session.run(query, parameters=params)
-                data = await result.data()
-                return data
-        except Neo4jError as error:
-            logger.error("Neo4j query error: %s", error, exc_info=True)
-            raise error
+        with new_span("cognee.db.graph.query") as otel_span:
+            otel_span.set_attribute(COGNEE_DB_SYSTEM, "neo4j")
+            otel_span.set_attribute(COGNEE_DB_QUERY, redact_secrets(query[:500]))
+
+            try:
+                async with self.get_session() as session:
+                    result = await session.run(query, parameters=params)
+                    data = await result.data()
+                    otel_span.set_attribute(COGNEE_DB_ROW_COUNT, len(data))
+                    return data
+            except Neo4jError as error:
+                otel_span.set_status(StatusCode.ERROR, str(error))
+                otel_span.record_exception(error)
+                logger.error("Neo4j query error: %s", error, exc_info=True)
+                raise error
 
     async def has_node(self, node_id: str) -> bool:
         """
@@ -103,8 +175,8 @@ class Neo4jAdapter(GraphDBInterface):
             - bool: True if the node exists, otherwise False.
         """
         results = self.query(
-            """
-                MATCH (n)
+            f"""
+                MATCH (n:`{BASE_LABEL}`)
                 WHERE n.id = $node_id
                 RETURN COUNT(n) > 0 AS node_exists
             """,
@@ -129,7 +201,7 @@ class Neo4jAdapter(GraphDBInterface):
         serialized_properties = self.serialize_properties(node.model_dump())
 
         query = dedent(
-            """MERGE (node {id: $node_id})
+            f"""MERGE (node: `{BASE_LABEL}`{{id: $node_id}})
                 ON CREATE SET node += $properties, node.updated_at = timestamp()
                 ON MATCH SET node += $properties, node.updated_at = timestamp()
                 WITH node, $node_label AS label
@@ -145,7 +217,7 @@ class Neo4jAdapter(GraphDBInterface):
 
         return await self.query(query, params)
 
-    @record_graph_changes
+    @override_distributed(queued_add_nodes)
     async def add_nodes(self, nodes: list[DataPoint]) -> None:
         """
         Add multiple nodes to the database in a single query.
@@ -161,9 +233,9 @@ class Neo4jAdapter(GraphDBInterface):
 
             - None: None
         """
-        query = """
+        query = f"""
         UNWIND $nodes AS node
-        MERGE (n {id: node.node_id})
+        MERGE (n: `{BASE_LABEL}`{{id: node.node_id}})
         ON CREATE SET n += node.properties, n.updated_at = timestamp()
         ON MATCH SET n += node.properties, n.updated_at = timestamp()
         WITH n, node.label AS label
@@ -175,7 +247,7 @@ class Neo4jAdapter(GraphDBInterface):
             {
                 "node_id": str(node.id),
                 "label": type(node).__name__,
-                "properties": self.serialize_properties(node.model_dump()),
+                "properties": self.serialize_properties(dict(node)),
             }
             for node in nodes
         ]
@@ -215,9 +287,9 @@ class Neo4jAdapter(GraphDBInterface):
 
             A list of nodes represented as dictionaries.
         """
-        query = """
+        query = f"""
         UNWIND $node_ids AS id
-        MATCH (node {id: id})
+        MATCH (node: `{BASE_LABEL}`{{id: id}})
         RETURN node"""
 
         params = {"node_ids": node_ids}
@@ -240,7 +312,7 @@ class Neo4jAdapter(GraphDBInterface):
 
             The result of the query execution, typically indicating success or failure.
         """
-        query = "MATCH (node {id: $node_id}) DETACH DELETE node"
+        query = f"MATCH (node: `{BASE_LABEL}`{{id: $node_id}}) DETACH DELETE node"
         params = {"node_id": node_id}
 
         return await self.query(query, params)
@@ -259,9 +331,9 @@ class Neo4jAdapter(GraphDBInterface):
 
             - None: None
         """
-        query = """
+        query = f"""
         UNWIND $node_ids AS id
-        MATCH (node {id: id})
+        MATCH (node: `{BASE_LABEL}`{{id: id}})
         DETACH DELETE node"""
 
         params = {"node_ids": node_ids}
@@ -284,16 +356,15 @@ class Neo4jAdapter(GraphDBInterface):
 
             - bool: True if the edge exists, otherwise False.
         """
-        query = """
-            MATCH (from_node)-[relationship]->(to_node)
-            WHERE from_node.id = $from_node_id AND to_node.id = $to_node_id AND type(relationship) = $edge_label
+        query = f"""
+            MATCH (from_node: `{BASE_LABEL}`)-[:`{edge_label}`]->(to_node: `{BASE_LABEL}`)
+            WHERE from_node.id = $from_node_id AND to_node.id = $to_node_id
             RETURN COUNT(relationship) > 0 AS edge_exists
         """
 
         params = {
             "from_node_id": str(from_node),
             "to_node_id": str(to_node),
-            "edge_label": edge_label,
         }
 
         edge_exists = await self.query(query, params)
@@ -366,9 +437,9 @@ class Neo4jAdapter(GraphDBInterface):
 
         query = dedent(
             f"""\
-            MATCH (from_node {{id: $from_node}}),
-                  (to_node {{id: $to_node}})
-            MERGE (from_node)-[r:{relationship_name}]->(to_node)
+            MATCH (from_node :`{BASE_LABEL}`{{id: $from_node}}),
+                  (to_node :`{BASE_LABEL}`{{id: $to_node}})
+            MERGE (from_node)-[r:`{relationship_name}`]->(to_node)
             ON CREATE SET r += $properties, r.updated_at = timestamp()
             ON MATCH SET r += $properties, r.updated_at = timestamp()
             RETURN r
@@ -384,7 +455,39 @@ class Neo4jAdapter(GraphDBInterface):
 
         return await self.query(query, params)
 
-    @record_graph_changes
+    def _flatten_edge_properties(self, properties: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Flatten edge properties to handle nested dictionaries like weights.
+
+        Neo4j doesn't support nested dictionaries as property values, so we need to
+        flatten the 'weights' dictionary into individual properties with prefixes.
+
+        Args:
+            properties: Dictionary of edge properties that may contain nested dicts
+
+        Returns:
+            Flattened properties dictionary suitable for Neo4j storage
+        """
+        flattened = {}
+
+        for key, value in properties.items():
+            if key == "weights" and isinstance(value, dict):
+                # Flatten weights dictionary into individual properties
+                for weight_name, weight_value in value.items():
+                    flattened[f"weight_{weight_name}"] = weight_value
+            elif isinstance(value, dict):
+                # For other nested dictionaries, serialize as JSON string
+                flattened[f"{key}_json"] = json.dumps(value, cls=JSONEncoder)
+            elif isinstance(value, list):
+                # For lists, serialize as JSON string
+                flattened[f"{key}_json"] = json.dumps(value, cls=JSONEncoder)
+            else:
+                # Keep primitive types as-is
+                flattened[key] = value
+
+        return flattened
+
+    @override_distributed(queued_add_edges)
     async def add_edges(self, edges: list[tuple[str, str, str, dict[str, Any]]]) -> None:
         """
         Add multiple edges between nodes in a single query.
@@ -400,17 +503,17 @@ class Neo4jAdapter(GraphDBInterface):
 
             - None: None
         """
-        query = """
+        query = f"""
             UNWIND $edges AS edge
-            MATCH (from_node {id: edge.from_node})
-            MATCH (to_node {id: edge.to_node})
+            MATCH (from_node: `{BASE_LABEL}`{{id: edge.from_node}})
+            MATCH (to_node: `{BASE_LABEL}`{{id: edge.to_node}})
             CALL apoc.merge.relationship(
                 from_node,
                 edge.relationship_name,
-                {
+                {{
                     source_node_id: edge.from_node,
                     target_node_id: edge.to_node
-                },
+                }},
                 edge.properties,
                 to_node
             ) YIELD rel
@@ -421,11 +524,13 @@ class Neo4jAdapter(GraphDBInterface):
                 "from_node": str(edge[0]),
                 "to_node": str(edge[1]),
                 "relationship_name": edge[2],
-                "properties": {
-                    **(edge[3] if edge[3] else {}),
-                    "source_node_id": str(edge[0]),
-                    "target_node_id": str(edge[1]),
-                },
+                "properties": self._flatten_edge_properties(
+                    {
+                        **(edge[3] if edge[3] else {}),
+                        "source_node_id": str(edge[0]),
+                        "target_node_id": str(edge[1]),
+                    }
+                ),
             }
             for edge in edges
         ]
@@ -451,8 +556,8 @@ class Neo4jAdapter(GraphDBInterface):
 
             A list of edges connecting to the specified node, represented as tuples of details.
         """
-        query = """
-        MATCH (n {id: $node_id})-[r]-(m)
+        query = f"""
+        MATCH (n: `{BASE_LABEL}`{{id: $node_id}})-[r]-(m)
         RETURN n, r, m
         """
 
@@ -525,9 +630,9 @@ class Neo4jAdapter(GraphDBInterface):
             - list[str]: A list of predecessor node IDs.
         """
         if edge_label is not None:
-            query = """
-            MATCH (node)<-[r]-(predecessor)
-            WHERE node.id = $node_id AND type(r) = $edge_label
+            query = f"""
+            MATCH (node: `{BASE_LABEL}`)<-[r:`{edge_label}`]-(predecessor)
+            WHERE node.id = $node_id
             RETURN predecessor
             """
 
@@ -535,14 +640,13 @@ class Neo4jAdapter(GraphDBInterface):
                 query,
                 dict(
                     node_id=node_id,
-                    edge_label=edge_label,
                 ),
             )
 
             return [result["predecessor"] for result in results]
         else:
-            query = """
-            MATCH (node)<-[r]-(predecessor)
+            query = f"""
+            MATCH (node: `{BASE_LABEL}`)<-[r]-(predecessor)
             WHERE node.id = $node_id
             RETURN predecessor
             """
@@ -572,9 +676,9 @@ class Neo4jAdapter(GraphDBInterface):
             - list[str]: A list of successor node IDs.
         """
         if edge_label is not None:
-            query = """
-            MATCH (node)-[r]->(successor)
-            WHERE node.id = $node_id AND type(r) = $edge_label
+            query = f"""
+            MATCH (node: `{BASE_LABEL}`)-[r:`{edge_label}`]->(successor)
+            WHERE node.id = $node_id
             RETURN successor
             """
 
@@ -588,8 +692,8 @@ class Neo4jAdapter(GraphDBInterface):
 
             return [result["successor"] for result in results]
         else:
-            query = """
-            MATCH (node)-[r]->(successor)
+            query = f"""
+            MATCH (node: `{BASE_LABEL}`)-[r]->(successor)
             WHERE node.id = $node_id
             RETURN successor
             """
@@ -607,6 +711,10 @@ class Neo4jAdapter(GraphDBInterface):
         """
         Get all neighbors of a specified node, including all directly connected nodes.
 
+        This method retrieves all neighboring nodes connected to a specified node and returns
+        their properties as a list of dictionaries. It may return an empty list if no neighbors exist or an
+        error occurs.
+
         Parameters:
         -----------
 
@@ -617,7 +725,16 @@ class Neo4jAdapter(GraphDBInterface):
 
             - List[Dict[str, Any]]: A list of neighboring nodes represented as dictionaries.
         """
-        return await self.get_neighbours(node_id)
+        query = f"""
+           MATCH (n: `{BASE_LABEL}` {{id: $node_id}})--(m: `{BASE_LABEL}`)
+           RETURN DISTINCT properties(m) AS properties
+           """
+        try:
+            result = await self.query(query, {"node_id": node_id})
+            return [row["properties"] for row in result] if result else []
+        except Exception as exc:
+            logger.error(f"Failed to get neighbors for node {node_id}: {exc}")
+            raise exc
 
     async def get_node(self, node_id: str) -> Optional[Dict[str, Any]]:
         """
@@ -634,8 +751,8 @@ class Neo4jAdapter(GraphDBInterface):
             - Optional[Dict[str, Any]]: The requested node as a dictionary, or None if it does
               not exist.
         """
-        query = """
-        MATCH (node {id: $node_id})
+        query = f"""
+        MATCH (node: `{BASE_LABEL}`{{id: $node_id}})
         RETURN node
         """
         results = await self.query(query, {"node_id": node_id})
@@ -655,13 +772,124 @@ class Neo4jAdapter(GraphDBInterface):
 
             - List[Dict[str, Any]]: A list of nodes represented as dictionaries.
         """
-        query = """
+        query = f"""
         UNWIND $node_ids AS id
-        MATCH (node {id: id})
+        MATCH (node:`{BASE_LABEL}` {{id: id}})
         RETURN node
         """
         results = await self.query(query, {"node_ids": node_ids})
         return [result["node"] for result in results]
+
+    def _build_node_feedback_items(
+        self, node_feedback_weights: Dict[str, float]
+    ) -> List[Dict[str, Any]]:
+        """Build UNWIND items for node feedback weight updates."""
+        return [
+            {"node_id": node_id, "feedback_weight": float(weight)}
+            for node_id, weight in node_feedback_weights.items()
+            if isinstance(node_id, str) and node_id
+        ]
+
+    async def _execute_node_feedback_updates(self, items: List[Dict[str, Any]]) -> Set[str]:
+        """Run node feedback weight UNWIND/SET; return set of updated node_ids."""
+        if not items:
+            return set()
+        query = """
+        UNWIND $items AS item
+        MATCH (n:`__Node__` {id: item.node_id})
+        SET n.feedback_weight = item.feedback_weight, n.updated_at = timestamp()
+        RETURN n.id AS node_id
+        """
+        results = await self.query(query, {"items": items})
+        return {str(r["node_id"]) for r in results if r.get("node_id") is not None}
+
+    def _build_edge_feedback_items(
+        self, edge_feedback_weights: Dict[str, float]
+    ) -> List[Dict[str, Any]]:
+        """Build UNWIND items for edge feedback weight updates."""
+        return [
+            {"edge_object_id": edge_object_id, "feedback_weight": float(weight)}
+            for edge_object_id, weight in edge_feedback_weights.items()
+            if isinstance(edge_object_id, str) and edge_object_id
+        ]
+
+    async def _execute_edge_feedback_updates(self, items: List[Dict[str, Any]]) -> Set[str]:
+        """Run edge feedback weight UNWIND/SET; return set of updated edge_object_ids."""
+        if not items:
+            return set()
+        query = """
+        UNWIND $items AS item
+        MATCH ()-[r]->()
+        WHERE r.edge_object_id = item.edge_object_id
+        SET r.feedback_weight = item.feedback_weight, r.updated_at = timestamp()
+        RETURN r.edge_object_id AS edge_object_id
+        """
+        results = await self.query(query, {"items": items})
+        return {str(r["edge_object_id"]) for r in results if r.get("edge_object_id") is not None}
+
+    async def get_node_feedback_weights(self, node_ids: List[str]) -> Dict[str, float]:
+        if not node_ids:
+            return {}
+        valid_node_ids = [nid for nid in node_ids if isinstance(nid, str) and nid]
+        if not valid_node_ids:
+            return {}
+        query = """
+        UNWIND $node_ids AS node_id
+        MATCH (n:`__Node__` {id: node_id})
+        RETURN n.id AS node_id, coalesce(n.feedback_weight, $default_weight) AS feedback_weight
+        """
+        results = await self.query(query, {"node_ids": valid_node_ids, "default_weight": 0.5})
+        return {
+            str(row["node_id"]): float(row["feedback_weight"])
+            for row in results
+            if row.get("node_id") is not None
+        }
+
+    async def set_node_feedback_weights(
+        self, node_feedback_weights: Dict[str, float]
+    ) -> Dict[str, bool]:
+        if not node_feedback_weights:
+            return {}
+        node_ids = list(node_feedback_weights.keys())
+        items = self._build_node_feedback_items(node_feedback_weights)
+        if not items:
+            return {nid: False for nid in node_ids}
+        updated_ids = await self._execute_node_feedback_updates(items)
+        return {nid: (nid in updated_ids) for nid in node_ids}
+
+    async def get_edge_feedback_weights(self, edge_object_ids: List[str]) -> Dict[str, float]:
+        if not edge_object_ids:
+            return {}
+        valid_edge_ids = [eid for eid in edge_object_ids if isinstance(eid, str) and eid]
+        if not valid_edge_ids:
+            return {}
+        query = """
+        UNWIND $edge_object_ids AS edge_object_id
+        MATCH ()-[r]->()
+        WHERE r.edge_object_id = edge_object_id
+        RETURN r.edge_object_id AS edge_object_id, coalesce(r.feedback_weight, $default_weight) AS feedback_weight
+        """
+        results = await self.query(
+            query,
+            {"edge_object_ids": valid_edge_ids, "default_weight": 0.5},
+        )
+        return {
+            str(row["edge_object_id"]): float(row["feedback_weight"])
+            for row in results
+            if row.get("edge_object_id") is not None
+        }
+
+    async def set_edge_feedback_weights(
+        self, edge_feedback_weights: Dict[str, float]
+    ) -> Dict[str, bool]:
+        if not edge_feedback_weights:
+            return {}
+        edge_ids = list(edge_feedback_weights.keys())
+        items = self._build_edge_feedback_items(edge_feedback_weights)
+        if not items:
+            return {eid: False for eid in edge_ids}
+        updated_ids = await self._execute_edge_feedback_updates(items)
+        return {eid: (eid in updated_ids) for eid in edge_ids}
 
     async def get_connections(self, node_id: UUID) -> list:
         """
@@ -677,13 +905,13 @@ class Neo4jAdapter(GraphDBInterface):
 
             - list: A list of connections represented as tuples of details.
         """
-        predecessors_query = """
-        MATCH (node)<-[relation]-(neighbour)
+        predecessors_query = f"""
+        MATCH (node:`{BASE_LABEL}`)<-[relation]-(neighbour)
         WHERE node.id = $node_id
         RETURN neighbour, relation, node
         """
-        successors_query = """
-        MATCH (node)-[relation]->(neighbour)
+        successors_query = f"""
+        MATCH (node:`{BASE_LABEL}`)-[relation]->(neighbour)
         WHERE node.id = $node_id
         RETURN node, relation, neighbour
         """
@@ -723,6 +951,7 @@ class Neo4jAdapter(GraphDBInterface):
 
             - None: None
         """
+        # Not understanding
         query = f"""
         UNWIND $node_ids AS id
         MATCH (node:`{id}`)-[r:{edge_label}]->(predecessor)
@@ -751,6 +980,7 @@ class Neo4jAdapter(GraphDBInterface):
 
             - None: None
         """
+        # Not understanding
         query = f"""
         UNWIND $node_ids AS id
         MATCH (node:`{id}`)<-[r:{edge_label}]-(successor)
@@ -770,10 +1000,20 @@ class Neo4jAdapter(GraphDBInterface):
 
             The result of the query execution, typically indicating success or failure.
         """
-        query = """MATCH (node)
-                DETACH DELETE node;"""
+        # query = """MATCH (node)
+        #         DETACH DELETE node;"""
 
-        return await self.query(query)
+        # return await self.query(query)
+
+        node_labels = await self.get_node_labels()
+
+        for label in node_labels:
+            query = f"""
+            MATCH (node:`{label}`)
+            DETACH DELETE node;
+            """
+
+            await self.query(query)
 
     def serialize_properties(self, properties=dict()):
         """
@@ -832,37 +1072,197 @@ class Neo4jAdapter(GraphDBInterface):
 
             A tuple containing two lists: nodes and edges with their properties.
         """
-        query = "MATCH (n) RETURN ID(n) AS id, labels(n) AS labels, properties(n) AS properties"
+        import time
 
-        result = await self.query(query)
+        start_time = time.time()
 
-        nodes = [
-            (
-                record["properties"]["id"],
-                record["properties"],
+        try:
+            # Retrieve nodes
+            query = "MATCH (n) RETURN ID(n) AS id, labels(n) AS labels, properties(n) AS properties"
+            result = await self.query(query)
+
+            nodes = []
+            for record in result:
+                nodes.append(
+                    (
+                        record["properties"]["id"],
+                        record["properties"],
+                    )
+                )
+
+            # Retrieve edges
+            query = """
+            MATCH (n)-[r]->(m)
+            RETURN ID(n) AS source, ID(m) AS target, TYPE(r) AS type, properties(r) AS properties
+            """
+            result = await self.query(query)
+
+            edges = []
+            for record in result:
+                edges.append(
+                    (
+                        record["properties"]["source_node_id"],
+                        record["properties"]["target_node_id"],
+                        record["type"],
+                        record["properties"],
+                    )
+                )
+
+            retrieval_time = time.time() - start_time
+            logger.info(
+                f"Retrieved {len(nodes)} nodes and {len(edges)} edges in {retrieval_time:.2f} seconds"
             )
-            for record in result
-        ]
 
-        query = """
-        MATCH (n)-[r]->(m)
-        RETURN ID(n) AS source, ID(m) AS target, TYPE(r) AS type, properties(r) AS properties
+            return (nodes, edges)
+
+        except Exception as e:
+            logger.error(f"Error during graph data retrieval: {str(e)}")
+            raise
+
+    async def get_neighborhood(
+        self,
+        node_ids: List[str],
+        depth: int = 1,
+        edge_types: Optional[List[str]] = None,
+    ) -> Tuple[List[Tuple[str, Dict[str, Any]]], List[Tuple[str, str, str, Dict[str, Any]]]]:
         """
-        result = await self.query(query)
-        edges = [
-            (
-                record["properties"]["source_node_id"],
-                record["properties"]["target_node_id"],
-                record["type"],
-                record["properties"],
-            )
-            for record in result
-        ]
+        Get the k-hop neighborhood subgraph around a set of seed nodes.
 
-        return (nodes, edges)
+        Returns all nodes and edges within `depth` hops of any seed node,
+        in the same format as get_graph_data().
+        """
+        import time
+
+        start_time = time.time()
+
+        try:
+            if not node_ids:
+                logger.warning("No node IDs provided for neighborhood retrieval.")
+                return [], []
+
+            # Collect all node IDs within depth hops, then fetch nodes and edges
+            if edge_types:
+                path_query = f"""
+                MATCH path = (seed)-[*1..{depth}]-(neighbor)
+                WHERE seed.id IN $node_ids
+                  AND ALL(r IN relationships(path) WHERE TYPE(r) IN $edge_types)
+                RETURN DISTINCT neighbor.id AS nid
+                """
+            else:
+                path_query = f"""
+                MATCH (seed)-[*1..{depth}]-(neighbor)
+                WHERE seed.id IN $node_ids
+                RETURN DISTINCT neighbor.id AS nid
+                """
+
+            params = {"node_ids": node_ids}
+            if edge_types:
+                params["edge_types"] = edge_types
+
+            result = await self.query(path_query, params)
+            neighbor_ids = [record["nid"] for record in result if record.get("nid")]
+
+            all_ids = list(set(node_ids) | set(neighbor_ids))
+
+            # Step 2: Fetch all nodes
+            nodes_query = """
+            MATCH (n)
+            WHERE n.id IN $ids
+            RETURN n.id AS id, properties(n) AS properties
+            """
+            nodes_result = await self.query(nodes_query, {"ids": all_ids})
+            nodes = []
+            for record in nodes_result:
+                nodes.append((record["properties"]["id"], record["properties"]))
+
+            # Step 3: Fetch all edges between collected nodes
+            edges_query = """
+            MATCH (n)-[r]->(m)
+            WHERE n.id IN $ids AND m.id IN $ids
+            RETURN properties(r) AS properties, TYPE(r) AS type
+            """
+            edges_result = await self.query(edges_query, {"ids": all_ids})
+            edges = []
+            for record in edges_result:
+                edges.append(
+                    (
+                        record["properties"]["source_node_id"],
+                        record["properties"]["target_node_id"],
+                        record["type"],
+                        record["properties"],
+                    )
+                )
+
+            retrieval_time = time.time() - start_time
+            logger.info(
+                f"Neighborhood retrieval ({depth}-hop): {len(nodes)} nodes and "
+                f"{len(edges)} edges in {retrieval_time:.2f}s"
+            )
+            return (nodes, edges)
+
+        except Exception as e:
+            logger.error(f"Error during neighborhood retrieval: {str(e)}")
+            raise
+
+    async def get_id_filtered_graph_data(self, target_ids: list[str]):
+        """
+        Retrieve graph data filtered by specific node IDs, including their direct neighbors
+        and only edges where one endpoint matches those IDs.
+
+        This version uses a single Cypher query for efficiency.
+        """
+        import time
+
+        start_time = time.time()
+
+        try:
+            if not target_ids:
+                logger.warning("No target IDs provided for ID-filtered graph retrieval.")
+                return [], []
+
+            query = """
+            MATCH ()-[r]-()
+            WHERE startNode(r).id IN $target_ids
+               OR endNode(r).id IN $target_ids
+            WITH DISTINCT r, startNode(r) AS a, endNode(r) AS b
+            RETURN
+                properties(a) AS n_properties,
+                properties(b) AS m_properties,
+                type(r) AS type,
+                properties(r) AS properties
+            """
+
+            result = await self.query(query, {"target_ids": target_ids})
+
+            nodes_dict = {}
+            edges = []
+
+            for record in result:
+                n_props = record["n_properties"]
+                m_props = record["m_properties"]
+                r_props = record["properties"]
+                r_type = record["type"]
+
+                nodes_dict[n_props["id"]] = (n_props["id"], n_props)
+                nodes_dict[m_props["id"]] = (m_props["id"], m_props)
+
+                source_id = r_props.get("source_node_id", n_props["id"])
+                target_id = r_props.get("target_node_id", m_props["id"])
+                edges.append((source_id, target_id, r_type, r_props))
+
+            retrieval_time = time.time() - start_time
+            logger.info(
+                f"ID-filtered retrieval: {len(nodes_dict)} nodes and {len(edges)} edges in {retrieval_time:.2f}s"
+            )
+
+            return list(nodes_dict.values()), edges
+
+        except Exception as e:
+            logger.error(f"Error during ID-filtered graph data retrieval: {str(e)}")
+            raise
 
     async def get_nodeset_subgraph(
-        self, node_type: Type[Any], node_name: List[str]
+        self, node_type: Type[Any], node_name: List[str], node_name_filter_operator: str = "OR"
     ) -> Tuple[List[Tuple[int, dict]], List[Tuple[int, int, str, dict]]]:
         """
         Retrieve a subgraph based on specified node names and type, including their
@@ -880,50 +1280,93 @@ class Neo4jAdapter(GraphDBInterface):
             - Tuple[List[Tuple[int, dict]], List[Tuple[int, int, str, dict]]}: A tuple
               containing nodes and edges in the requested subgraph.
         """
-        label = node_type.__name__
+        import time
 
-        query = f"""
-        UNWIND $names AS wantedName
-        MATCH (n:`{label}`)
-        WHERE n.name = wantedName
-        WITH collect(DISTINCT n) AS primary
-        UNWIND primary AS p
-        OPTIONAL MATCH (p)--(nbr)
-        WITH primary, collect(DISTINCT nbr) AS nbrs
-        WITH primary + nbrs AS nodelist
-        UNWIND nodelist AS node
-        WITH collect(DISTINCT node) AS nodes
-        MATCH (a)-[r]-(b)
-        WHERE a IN nodes AND b IN nodes
-        WITH nodes, collect(DISTINCT r) AS rels
-        RETURN
-          [n IN nodes |
-             {{ id: n.id,
-                properties: properties(n) }}] AS rawNodes,
-          [r IN rels  |
-             {{ type: type(r),
-                properties: properties(r) }}] AS rawRels
-        """
+        start_time = time.time()
 
-        result = await self.query(query, {"names": node_name})
-        if not result:
-            return [], []
+        try:
+            label = node_type.__name__
 
-        raw_nodes = result[0]["rawNodes"]
-        raw_rels = result[0]["rawRels"]
+            if node_name_filter_operator == "OR":
+                query = f"""
+                UNWIND $names AS wantedName
+                MATCH (n:`{label}`)
+                WHERE n.name = wantedName
+                WITH collect(DISTINCT n) AS primary
+                UNWIND primary AS p
+                OPTIONAL MATCH (p)--(nbr)
+                WITH primary, collect(DISTINCT nbr) AS nbrs
+                WITH primary + nbrs AS nodelist
+                UNWIND nodelist AS node
+                WITH collect(DISTINCT node) AS nodes
+                MATCH (a)-[r]-(b)
+                WHERE a IN nodes AND b IN nodes
+                WITH nodes, collect(DISTINCT r) AS rels
+                RETURN
+                  [n IN nodes |
+                     {{ id: n.id,
+                        properties: properties(n) }}] AS rawNodes,
+                  [r IN rels  |
+                     {{ type: type(r),
+                        properties: properties(r) }}] AS rawRels
+                """
+            else:
+                query = f"""
+                UNWIND $names AS wantedName
+                MATCH (n:`{label}`)
+                WHERE n.name = wantedName
+                WITH collect(DISTINCT n) AS primary
+                UNWIND primary AS p
+                MATCH (p)--(nbr)
+                WITH primary, nbr, COUNT(DISTINCT p) AS matched_count
+                WHERE matched_count = size(primary)
+                WITH primary, collect(DISTINCT nbr) AS nbrs
+                WITH primary + nbrs AS nodelist
+                UNWIND nodelist AS node
+                WITH collect(DISTINCT node) AS nodes
+                MATCH (a)-[r]-(b)
+                WHERE a IN nodes AND b IN nodes
+                WITH nodes, collect(DISTINCT r) AS rels
+                RETURN
+                  [n IN nodes | {{ id: n.id, properties: properties(n) }}] AS rawNodes,
+                  [r IN rels  | {{ type: type(r), properties: properties(r) }}] AS rawRels
+                """
 
-        nodes = [(n["properties"]["id"], n["properties"]) for n in raw_nodes]
-        edges = [
-            (
-                r["properties"]["source_node_id"],
-                r["properties"]["target_node_id"],
-                r["type"],
-                r["properties"],
+            result = await self.query(query, {"names": node_name})
+
+            if not result:
+                return [], []
+
+            raw_nodes = result[0]["rawNodes"]
+            raw_rels = result[0]["rawRels"]
+
+            # Process nodes
+            nodes = []
+            for n in raw_nodes:
+                nodes.append((n["properties"]["id"], n["properties"]))
+
+            # Process edges
+            edges = []
+            for r in raw_rels:
+                edges.append(
+                    (
+                        r["properties"]["source_node_id"],
+                        r["properties"]["target_node_id"],
+                        r["type"],
+                        r["properties"],
+                    )
+                )
+
+            retrieval_time = time.time() - start_time
+            logger.info(
+                f"Retrieved {len(nodes)} nodes and {len(edges)} edges for {node_type.__name__} in {retrieval_time:.2f} seconds"
             )
-            for r in raw_rels
-        ]
 
-        return nodes, edges
+            return nodes, edges
+
+        except Exception as e:
+            logger.error(f"Error during nodeset subgraph retrieval: {str(e)}")
+            raise
 
     async def get_filtered_graph_data(self, attribute_filters):
         """
@@ -952,7 +1395,7 @@ class Neo4jAdapter(GraphDBInterface):
         query_nodes = f"""
         MATCH (n)
         WHERE {where_clause}
-        RETURN ID(n) AS id, labels(n) AS labels, properties(n) AS properties
+        RETURN n.id AS id, labels(n) AS labels, properties(n) AS properties
         """
         result_nodes = await self.query(query_nodes)
 
@@ -967,14 +1410,14 @@ class Neo4jAdapter(GraphDBInterface):
         query_edges = f"""
         MATCH (n)-[r]->(m)
         WHERE {where_clause} AND {where_clause.replace("n.", "m.")}
-        RETURN ID(n) AS source, ID(m) AS target, TYPE(r) AS type, properties(r) AS properties
+        RETURN n.id AS source, n.id AS target, TYPE(r) AS type, properties(r) AS properties
         """
         result_edges = await self.query(query_edges)
 
         edges = [
             (
-                record["source"],
-                record["target"],
+                record["properties"]["source_node_id"],
+                record["properties"]["target_node_id"],
                 record["type"],
                 record["properties"],
             )
@@ -1003,24 +1446,20 @@ class Neo4jAdapter(GraphDBInterface):
         graph_names = result[0]["graphNames"] if result else []
         return graph_name in graph_names
 
-    async def get_node_labels_string(self):
+    async def get_node_labels(self):
         """
-        Fetch all node labels from the database and return them as a formatted string.
+        Fetch all node labels from the database and return them.
 
         Returns:
         --------
 
-            A formatted string of node labels.
+            A list of node labels.
         """
-        node_labels_query = "CALL db.labels() YIELD label RETURN collect(label) AS labels;"
+        node_labels_query = "CALL db.labels()"
         node_labels_result = await self.query(node_labels_query)
-        node_labels = node_labels_result[0]["labels"] if node_labels_result else []
+        node_labels = [record["label"] for record in node_labels_result]
 
-        if not node_labels:
-            raise ValueError("No node labels found in the database")
-
-        node_labels_str = "[" + ", ".join(f"'{label}'" for label in node_labels) + "]"
-        return node_labels_str
+        return node_labels
 
     async def get_relationship_labels_string(self):
         """
@@ -1060,13 +1499,13 @@ class Neo4jAdapter(GraphDBInterface):
         if await self.graph_exists(graph_name):
             return
 
-        node_labels_str = await self.get_node_labels_string()
+        node_labels = await self.get_node_labels()
         relationship_types_undirected_str = await self.get_relationship_labels_string()
 
         query = f"""
         CALL gds.graph.project(
             '{graph_name}',
-            {node_labels_str},
+            ['{"', '".join(node_labels)}'],
             {relationship_types_undirected_str}
         ) YIELD graphName;
         """
@@ -1144,7 +1583,7 @@ class Neo4jAdapter(GraphDBInterface):
 
         return mandatory_metrics | optional_metrics
 
-    async def get_document_subgraph(self, content_hash: str):
+    async def get_document_subgraph(self, data_id: str):
         """
         Retrieve a subgraph related to a document identified by its content hash, including
         related entities and chunks.
@@ -1162,21 +1601,21 @@ class Neo4jAdapter(GraphDBInterface):
         """
         query = """
         MATCH (doc)
-        WHERE (doc:TextDocument OR doc:PdfDocument)
-        AND doc.name = 'text_' + $content_hash
+        WHERE (doc:TextDocument OR doc:PdfDocument OR doc:UnstructuredDocument OR doc:AudioDocument or doc:ImageDocument)
+        AND doc.id = $data_id
 
         OPTIONAL MATCH (doc)<-[:is_part_of]-(chunk:DocumentChunk)
         OPTIONAL MATCH (chunk)-[:contains]->(entity:Entity)
         WHERE NOT EXISTS {
             MATCH (entity)<-[:contains]-(otherChunk:DocumentChunk)-[:is_part_of]->(otherDoc)
-            WHERE (otherDoc:TextDocument OR otherDoc:PdfDocument)
+            WHERE (otherDoc:TextDocument OR otherDoc:PdfDocument OR otherDoc:UnstructuredDocument OR otherDoc:AudioDocument or otherDoc:ImageDocument)
             AND otherDoc.id <> doc.id
         }
         OPTIONAL MATCH (chunk)<-[:made_from]-(made_node:TextSummary)
         OPTIONAL MATCH (entity)-[:is_a]->(type:EntityType)
         WHERE NOT EXISTS {
             MATCH (type)<-[:is_a]-(otherEntity:Entity)<-[:contains]-(otherChunk:DocumentChunk)-[:is_part_of]->(otherDoc)
-            WHERE (otherDoc:TextDocument OR otherDoc:PdfDocument)
+            WHERE (otherDoc:TextDocument OR otherDoc:PdfDocument OR otherDoc:UnstructuredDocument OR otherDoc:AudioDocument or otherDoc:ImageDocument)
             AND otherDoc.id <> doc.id
         }
 
@@ -1187,7 +1626,7 @@ class Neo4jAdapter(GraphDBInterface):
             collect(DISTINCT made_node) as made_from_nodes,
             collect(DISTINCT type) as orphan_types
         """
-        result = await self.query(query, {"content_hash": content_hash})
+        result = await self.query(query, {"data_id": data_id})
         return result[0] if result else None
 
     async def get_degree_one_nodes(self, node_type: str):
@@ -1214,3 +1653,112 @@ class Neo4jAdapter(GraphDBInterface):
         """
         result = await self.query(query)
         return [record["n"] for record in result] if result else []
+
+    async def collect_events(self, ids: List[str]) -> Any:
+        """
+        Collect all Event-type nodes reachable within 1..2 hops
+        from the given node IDs.
+
+        Args:
+            graph_engine: Object exposing an async .query(str) -> Any
+            ids: List of node IDs (strings)
+
+        Returns:
+            List of events
+        """
+
+        event_collection_cypher = """UNWIND [{quoted}] AS uid
+            MATCH (start {{id: uid}})
+            MATCH (start)-[*1..2]-(event)
+            WHERE event.type = 'Event'
+            WITH DISTINCT event
+            RETURN collect(event) AS events;
+        """
+
+        query = event_collection_cypher.format(quoted=ids)
+        return await self.query(query)
+
+    async def collect_time_ids(
+        self,
+        time_from: Optional[Timestamp] = None,
+        time_to: Optional[Timestamp] = None,
+    ) -> str:
+        """
+        Collect IDs of Timestamp nodes between time_from and time_to.
+
+        Args:
+            graph_engine: Object exposing an async .query(query, params) -> list[dict]
+            time_from: Lower bound int (inclusive), optional
+            time_to: Upper bound int (inclusive), optional
+
+        Returns:
+            A string of quoted IDs:  "'id1', 'id2', 'id3'"
+            (ready for use in a Cypher UNWIND clause).
+        """
+
+        ids: List[str] = []
+
+        if time_from and time_to:
+            time_from = date_to_int(time_from)
+            time_to = date_to_int(time_to)
+
+            cypher = """
+            MATCH (n)
+            WHERE n.type = 'Timestamp'
+              AND n.time_at >= $time_from
+              AND n.time_at <= $time_to
+            RETURN n.id AS id
+            """
+            params = {"time_from": time_from, "time_to": time_to}
+
+        elif time_from:
+            time_from = date_to_int(time_from)
+
+            cypher = """
+            MATCH (n)
+            WHERE n.type = 'Timestamp'
+              AND n.time_at >= $time_from
+            RETURN n.id AS id
+            """
+            params = {"time_from": time_from}
+
+        elif time_to:
+            time_to = date_to_int(time_to)
+
+            cypher = """
+            MATCH (n)
+            WHERE n.type = 'Timestamp'
+              AND n.time_at <= $time_to
+            RETURN n.id AS id
+            """
+            params = {"time_to": time_to}
+
+        else:
+            return ids
+
+        time_nodes = await self.query(cypher, params)
+        time_ids_list = [item["id"] for item in time_nodes if "id" in item]
+
+        return ", ".join(f"'{uid}'" for uid in time_ids_list)
+
+    async def get_triplets_batch(self, offset: int, limit: int) -> list[dict[str, Any]]:
+        """
+        Retrieve a batch of triplets (start_node, relationship, end_node) from the graph.
+
+        Parameters:
+        -----------
+            - offset (int): Number of triplets to skip before returning results.
+            - limit (int): Maximum number of triplets to return.
+
+        Returns:
+        --------
+            - list[dict[str, Any]]: A list of triplets.
+        """
+        query = f"""
+        MATCH (start_node:`{BASE_LABEL}`)-[relationship]->(end_node:`{BASE_LABEL}`)
+        RETURN start_node, properties(relationship) AS relationship_properties, end_node
+        SKIP $offset LIMIT $limit
+        """
+        results = await self.query(query, {"offset": offset, "limit": limit})
+
+        return results

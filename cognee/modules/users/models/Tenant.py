@@ -1,7 +1,7 @@
-from sqlalchemy.orm import relationship
+from sqlalchemy.orm import relationship, Mapped
 from sqlalchemy import Column, String, ForeignKey, UUID
 from .Principal import Principal
-from .User import User
+from .UserTenant import UserTenant
 from .Role import Role
 
 
@@ -11,14 +11,15 @@ class Tenant(Principal):
     id = Column(UUID, ForeignKey("principals.id"), primary_key=True)
     name = Column(String, unique=True, nullable=False, index=True)
 
-    # One-to-Many relationship with User; specify the join via User.tenant_id
-    users = relationship(
+    owner_id = Column(UUID, index=True)
+
+    users: Mapped[list["User"]] = relationship(  # noqa: F821
         "User",
-        back_populates="tenant",
-        foreign_keys=lambda: [User.tenant_id],
+        secondary=UserTenant.__tablename__,
+        back_populates="tenants",
     )
 
-    # One-to-Many relationship with Role (if needed; similar fix)
+    # One-to-Many relationship with Role
     roles = relationship(
         "Role",
         back_populates="tenant",

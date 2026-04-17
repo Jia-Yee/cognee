@@ -18,6 +18,15 @@ class Dataset(Base):
     updated_at = Column(DateTime(timezone=True), onupdate=lambda: datetime.now(timezone.utc))
 
     owner_id = Column(UUID, index=True)
+    tenant_id = Column(UUID, index=True, nullable=True)
+
+    acls = relationship("ACL", back_populates="dataset", cascade="all, delete-orphan")
+    configuration = relationship(
+        "DatasetConfiguration",
+        back_populates="dataset",
+        uselist=False,
+        cascade="all, delete-orphan",
+    )
 
     data: Mapped[List["Data"]] = relationship(
         "Data",
@@ -34,5 +43,6 @@ class Dataset(Base):
             "createdAt": self.created_at.isoformat(),
             "updatedAt": self.updated_at.isoformat() if self.updated_at else None,
             "ownerId": str(self.owner_id),
+            "tenantId": str(self.tenant_id),
             "data": [data.to_json() for data in self.data],
         }

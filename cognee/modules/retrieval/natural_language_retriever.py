@@ -1,14 +1,13 @@
 from typing import Any, Optional
-import logging
+from cognee.shared.logging_utils import get_logger
 from cognee.infrastructure.databases.graph import get_graph_engine
-from cognee.infrastructure.databases.graph.networkx.adapter import NetworkXAdapter
-from cognee.infrastructure.llm.get_llm_client import get_llm_client
+from cognee.infrastructure.llm.LLMGateway import LLMGateway
 from cognee.infrastructure.llm.prompts import render_prompt
 from cognee.modules.retrieval.base_retriever import BaseRetriever
 from cognee.modules.retrieval.exceptions import SearchTypeNotSupported
 from cognee.infrastructure.databases.graph.graph_db_interface import GraphDBInterface
 
-logger = logging.getLogger("NaturalLanguageRetriever")
+logger = get_logger("NaturalLanguageRetriever")
 
 
 class NaturalLanguageRetriever(BaseRetriever):
@@ -26,10 +25,12 @@ class NaturalLanguageRetriever(BaseRetriever):
         self,
         system_prompt_path: str = "natural_language_retriever_system.txt",
         max_attempts: int = 3,
+        session_id: Optional[str] = None,
     ):
         """Initialize retriever with optional custom prompt paths."""
         self.system_prompt_path = system_prompt_path
         self.max_attempts = max_attempts
+        self.session_id = session_id
 
     async def _get_graph_schema(self, graph_engine) -> tuple:
         """Retrieve the node and edge schemas from the graph database."""
@@ -51,7 +52,6 @@ class NaturalLanguageRetriever(BaseRetriever):
 
     async def _generate_cypher_query(self, query: str, edge_schemas, previous_attempts=None) -> str:
         """Generate a Cypher query using LLM based on natural language query and schema information."""
-        llm_client = get_llm_client()
         system_prompt = render_prompt(
             self.system_prompt_path,
             context={
@@ -60,7 +60,7 @@ class NaturalLanguageRetriever(BaseRetriever):
             },
         )
 
-        return await llm_client.acreate_structured_output(
+        return await LLMGateway.acreate_structured_output(
             text_input=query,
             system_prompt=system_prompt,
             response_model=str,
@@ -104,7 +104,29 @@ class NaturalLanguageRetriever(BaseRetriever):
         )
         return []
 
-    async def get_context(self, query: str) -> Optional[Any]:
+    async def get_retrieved_objects(self, query: str) -> Any:
+        graph_engine = await get_graph_engine()
+
+        # Postgres backends do not support Cypher generation/execution
+        from cognee.infrastructure.databases.graph.postgres.adapter import PostgresAdapter
+        from cognee.infrastructure.databases.hybrid.postgres.adapter import PostgresHybridAdapter
+
+        if isinstance(graph_engine, (PostgresAdapter, PostgresHybridAdapter)):
+            raise SearchTypeNotSupported(
+                "Natural language search is not supported with the Postgres graph backend. "
+                "This retriever generates and executes Cypher queries, which require a "
+                "graph-native backend (Neo4j, Kuzu)."
+            )
+
+        is_empty = await graph_engine.is_empty()
+
+        if is_empty:
+            logger.warning("Search attempt on an empty knowledge graph")
+            return []
+
+        return await self._execute_cypher_query(query, graph_engine)
+
+    async def get_context_from_objects(self, query: str, retrieved_objects: Any) -> Optional[Any]:
         """
         Retrieves relevant context using a natural language query converted to Cypher.
 
@@ -123,18 +145,12 @@ class NaturalLanguageRetriever(BaseRetriever):
             - Optional[Any]: Returns the context retrieved from the graph database based on the
               query.
         """
-        try:
-            graph_engine = await get_graph_engine()
+        # TODO: Do we want to process retrieved_objects into a context string?
+        return retrieved_objects
 
-            if isinstance(graph_engine, (NetworkXAdapter)):
-                raise SearchTypeNotSupported("Natural language search type not supported.")
-
-            return await self._execute_cypher_query(query, graph_engine)
-        except Exception as e:
-            logger.error("Failed to execute natural language search retrieval: %s", str(e))
-            raise e
-
-    async def get_completion(self, query: str, context: Optional[Any] = None) -> Any:
+    async def get_completion_from_context(
+        self, query: str, retrieved_objects: Any, context: Optional[Any] = None
+    ) -> Any:
         """
         Returns a completion based on the query and context.
 
@@ -148,13 +164,13 @@ class NaturalLanguageRetriever(BaseRetriever):
             - query (str): The natural language query to get a completion from.
             - context (Optional[Any]): The context in which to base the completion; if not
               provided, it will be retrieved using the query. (default None)
+            - session_id (Optional[str]): Optional session identifier for caching. If None,
+              defaults to 'default_session'. (default None)
 
         Returns:
         --------
 
             - Any: Returns the completion derived from the given query and context.
         """
-        if context is None:
-            context = await self.get_context(query)
-
+        # TODO: Do we want to generate a completion using LLM here?
         return context

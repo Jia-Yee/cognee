@@ -1,28 +1,43 @@
 """Adapter for Kuzu graph database."""
 
-from cognee.infrastructure.databases.exceptions.exceptions import NodesetFilterNotSupportedError
-from cognee.shared.logging_utils import get_logger
-import json
 import os
-import shutil
+import json
 import asyncio
-from typing import Dict, Any, List, Union, Optional, Tuple, Type
+import tempfile
+from uuid import UUID, uuid5, NAMESPACE_OID
+from kuzu import Connection
+from kuzu.database import Database
 from datetime import datetime, timezone
-from uuid import UUID
 from contextlib import asynccontextmanager
 from concurrent.futures import ThreadPoolExecutor
-
-import kuzu
-from kuzu.database import Database
-from kuzu import Connection
+from typing import Dict, Any, List, Union, Optional, Tuple, Type, Set
+from cognee.modules.observability import OtelStatusCode as StatusCode
+from cognee.exceptions import CogneeValidationError
+from cognee.shared.logging_utils import get_logger
+from cognee.infrastructure.utils.run_sync import run_sync
+from cognee.infrastructure.files.storage import get_file_storage
 from cognee.infrastructure.databases.graph.graph_db_interface import (
     GraphDBInterface,
-    record_graph_changes,
 )
 from cognee.infrastructure.engine import DataPoint
 from cognee.modules.storage.utils import JSONEncoder
+from cognee.modules.engine.utils.generate_timestamp_datapoint import date_to_int
+from cognee.tasks.temporal_graph.models import Timestamp
+from cognee.infrastructure.databases.cache.config import get_cache_config
+from cognee.modules.observability import new_span
+from cognee.modules.observability.tracing import (
+    COGNEE_DB_SYSTEM,
+    COGNEE_DB_QUERY,
+    COGNEE_DB_ROW_COUNT,
+    redact_secrets,
+)
 
 logger = get_logger()
+
+
+cache_config = get_cache_config()
+if cache_config.shared_kuzu_lock:
+    from cognee.infrastructure.databases.cache.get_cache_engine import get_cache_engine
 
 
 class KuzuAdapter(GraphDBInterface):
@@ -37,19 +52,113 @@ class KuzuAdapter(GraphDBInterface):
 
     def __init__(self, db_path: str):
         """Initialize Kuzu database connection and schema."""
+        self.open_connections = 0
+        self._is_closed = False
         self.db_path = db_path  # Path for the database directory
         self.db: Optional[Database] = None
         self.connection: Optional[Connection] = None
-        self.executor = ThreadPoolExecutor()
-        self._initialize_connection()
+        if cache_config.shared_kuzu_lock:
+            self.redis_lock = get_cache_engine(
+                lock_key="kuzu-lock-" + str(uuid5(NAMESPACE_OID, db_path))
+            )
+        else:
+            self.executor = ThreadPoolExecutor()
+            self._initialize_connection()
+        self.KUZU_ASYNC_LOCK = asyncio.Lock()
+        self._connection_change_lock = asyncio.Lock()
 
     def _initialize_connection(self) -> None:
         """Initialize the Kuzu database connection and schema."""
+
+        def _install_json_extension():
+            """
+            Function handles installing of the json extension for the current Kuzu version.
+            This has to be done with an empty graph db before connecting to an existing database otherwise
+            missing json extension errors will be raised.
+            """
+            try:
+                with tempfile.NamedTemporaryFile(mode="w", delete=True) as temp_file:
+                    temp_graph_file = temp_file.name
+                    tmp_db = Database(
+                        temp_graph_file,
+                        buffer_pool_size=2048 * 1024 * 1024,  # 2048MB buffer pool
+                        max_db_size=4096 * 1024 * 1024,
+                    )
+                    tmp_db.init_database()
+                    connection = Connection(tmp_db)
+                    connection.execute("INSTALL JSON;")
+            except Exception as e:
+                logger.info(f"JSON extension already installed or not needed: {e}")
+
+        _install_json_extension()
+
         try:
-            os.makedirs(self.db_path, exist_ok=True)
-            self.db = Database(self.db_path)
+            if "s3://" in self.db_path:
+                with tempfile.NamedTemporaryFile(mode="w", delete=False) as temp_file:
+                    self.temp_graph_file = temp_file.name
+
+                run_sync(self.pull_from_s3())
+
+                self.db = Database(
+                    self.temp_graph_file,
+                    buffer_pool_size=2048 * 1024 * 1024,  # 2048MB buffer pool
+                    max_db_size=4096 * 1024 * 1024,
+                )
+            else:
+                # Ensure the parent directory exists before creating the database
+                db_dir = os.path.dirname(self.db_path)
+
+                # If db_path is just a filename, db_dir will be empty string
+                # In this case, use the directory containing the db_path or current directory
+                if not db_dir:
+                    # If no directory in path, use the absolute path's directory
+                    abs_path = os.path.abspath(self.db_path)
+                    db_dir = os.path.dirname(abs_path)
+
+                file_storage = get_file_storage(db_dir)
+
+                run_sync(file_storage.ensure_directory_exists())
+
+                try:
+                    self.db = Database(
+                        self.db_path,
+                        buffer_pool_size=2048 * 1024 * 1024,  # 2048MB buffer pool
+                        max_db_size=4096 * 1024 * 1024,
+                    )
+                except RuntimeError:
+                    from .kuzu_migrate import read_kuzu_storage_version
+                    import kuzu
+
+                    kuzu_db_version = read_kuzu_storage_version(self.db_path)
+                    if (
+                        kuzu_db_version == "0.9.0" or kuzu_db_version == "0.8.2"
+                    ) and kuzu_db_version != kuzu.__version__:
+                        # Try to migrate kuzu database to latest version
+                        from .kuzu_migrate import kuzu_migration
+
+                        kuzu_migration(
+                            new_db=self.db_path + "_new",
+                            old_db=self.db_path,
+                            new_version=kuzu.__version__,
+                            old_version=kuzu_db_version,
+                            overwrite=True,
+                        )
+
+                    self.db = Database(
+                        self.db_path,
+                        buffer_pool_size=2048 * 1024 * 1024,  # 2048MB buffer pool
+                        max_db_size=4096 * 1024 * 1024,
+                    )
+
             self.db.init_database()
             self.connection = Connection(self.db)
+
+            try:
+                self.connection.execute("LOAD EXTENSION JSON;")
+                logger.info("Loaded JSON extension")
+            except Exception as e:
+                logger.info(f"JSON extension already loaded or unavailable: {e}")
+
             # Create node table with essential fields and timestamp
             self.connection.execute("""
                 CREATE NODE TABLE IF NOT EXISTS Node(
@@ -74,7 +183,37 @@ class KuzuAdapter(GraphDBInterface):
             logger.debug("Kuzu database initialized successfully")
         except Exception as e:
             logger.error(f"Failed to initialize Kuzu database: {e}")
-            raise
+            raise e
+
+    async def push_to_s3(self) -> None:
+        if os.getenv("STORAGE_BACKEND", "").lower() == "s3" and hasattr(self, "temp_graph_file"):
+            from cognee.infrastructure.files.storage.S3FileStorage import S3FileStorage
+
+            s3_file_storage = S3FileStorage("")
+
+            if self.connection:
+                async with self.KUZU_ASYNC_LOCK:
+                    self.connection.execute("CHECKPOINT;")
+
+            s3_file_storage.s3.put(self.temp_graph_file, self.db_path, recursive=True)
+
+    async def pull_from_s3(self) -> None:
+        from cognee.infrastructure.files.storage.S3FileStorage import S3FileStorage
+
+        s3_file_storage = S3FileStorage("")
+        try:
+            s3_file_storage.s3.get(self.db_path, self.temp_graph_file, recursive=True)
+        except FileNotFoundError:
+            logger.warning(f"Kuzu S3 storage file not found: {self.db_path}")
+
+    async def is_empty(self) -> bool:
+        query = """
+        MATCH (n)
+        RETURN true
+        LIMIT 1;
+        """
+        query_result = await self.query(query)
+        return len(query_result) == 0
 
     async def query(self, query: str, params: Optional[dict] = None) -> List[Tuple]:
         """
@@ -96,32 +235,80 @@ class KuzuAdapter(GraphDBInterface):
 
             - List[Tuple]: A list of tuples representing the query results.
         """
-        loop = asyncio.get_running_loop()
-        params = params or {}
+        with new_span("cognee.db.graph.query") as otel_span:
+            otel_span.set_attribute(COGNEE_DB_SYSTEM, "kuzu")
+            otel_span.set_attribute(COGNEE_DB_QUERY, redact_secrets(query[:500]))
 
-        def blocking_query():
+            loop = asyncio.get_running_loop()
+            params = params or {}
+
+            def blocking_query():
+                lock_acquired = False
+                try:
+                    if cache_config.shared_kuzu_lock:
+                        self.redis_lock.acquire_lock()
+                        lock_acquired = True
+                    if not self.connection:
+                        logger.info("Reconnecting to Kuzu database...")
+                        self._initialize_connection()
+
+                    result = self.connection.execute(query, params)
+                    rows = []
+
+                    while result.has_next():
+                        row = result.get_next()
+                        processed_rows = []
+                        for val in row:
+                            if hasattr(val, "as_py"):
+                                val = val.as_py()
+                            processed_rows.append(val)
+                        rows.append(tuple(processed_rows))
+
+                    return rows
+                except Exception as e:
+                    logger.error(f"Query execution failed: {str(e)}")
+                    raise
+                finally:
+                    if cache_config.shared_kuzu_lock and lock_acquired:
+                        try:
+                            self.close()
+                        finally:
+                            self.redis_lock.release_lock()
+
             try:
-                if not self.connection:
-                    logger.debug("Reconnecting to Kuzu database...")
-                    self._initialize_connection()
+                if cache_config.shared_kuzu_lock:
+                    async with self._connection_change_lock:
+                        self.open_connections += 1
+                        logger.info(f"Open connections after open: {self.open_connections}")
+                        try:
+                            result = blocking_query()
+                        finally:
+                            self.open_connections -= 1
+                            logger.info(f"Open connections after close: {self.open_connections}")
+                else:
+                    result = await loop.run_in_executor(self.executor, blocking_query)
 
-                result = self.connection.execute(query, params)
-                rows = []
-
-                while result.has_next():
-                    row = result.get_next()
-                    processed_rows = []
-                    for val in row:
-                        if hasattr(val, "as_py"):
-                            val = val.as_py()
-                        processed_rows.append(val)
-                    rows.append(tuple(processed_rows))
-                return rows
+                otel_span.set_attribute(COGNEE_DB_ROW_COUNT, len(result))
+                return result
             except Exception as e:
-                logger.error(f"Query execution failed: {str(e)}")
-                raise
+                otel_span.set_status(StatusCode.ERROR, str(e))
+                otel_span.record_exception(e)
 
-        return await loop.run_in_executor(self.executor, blocking_query)
+    def close(self):
+        if self.connection:
+            del self.connection
+            self.connection = None
+        if self.db:
+            del self.db
+            self.db = None
+        self._is_closed = True
+        logger.info("Kuzu database closed successfully")
+
+    def reopen(self):
+        if self._is_closed:
+            self._is_closed = False
+            self._initialize_connection()
+            logger.info("Kuzu database re-opened successfully")
 
     @asynccontextmanager
     async def get_session(self):
@@ -269,7 +456,6 @@ class KuzuAdapter(GraphDBInterface):
             logger.error(f"Failed to add node: {e}")
             raise
 
-    @record_graph_changes
     async def add_nodes(self, nodes: List[DataPoint]) -> None:
         """
         Add multiple nodes to the graph in a batch operation.
@@ -566,7 +752,6 @@ class KuzuAdapter(GraphDBInterface):
             logger.error(f"Failed to add edge: {e}")
             raise
 
-    @record_graph_changes
     async def add_edges(self, edges: List[Tuple[str, str, str, Dict[str, Any]]]) -> None:
         """
         Add multiple edges in a batch operation.
@@ -691,7 +876,22 @@ class KuzuAdapter(GraphDBInterface):
             - List[Dict[str, Any]]: A list of dictionaries representing neighboring nodes'
               properties.
         """
-        return await self.get_neighbours(node_id)
+        query_str = """
+        MATCH (n:Node)-[r]-(m:Node)
+        WHERE n.id = $id
+        RETURN DISTINCT {
+            id: m.id,
+            name: m.name,
+            type: m.type,
+            properties: m.properties
+        }
+        """
+        try:
+            result = await self.query(query_str, {"id": node_id})
+            return [self._parse_node_properties(row[0]) for row in result] if result else []
+        except Exception as e:
+            logger.error(f"Failed to get neighbours for node {node_id}: {e}")
+            return []
 
     async def get_node(self, node_id: str) -> Optional[Dict[str, Any]]:
         """
@@ -766,36 +966,223 @@ class KuzuAdapter(GraphDBInterface):
             logger.error(f"Failed to get nodes: {e}")
             return []
 
-    async def get_neighbours(self, node_id: str) -> List[Dict[str, Any]]:
-        """
-        Get all neighbouring nodes.
+    def _rows_to_dicts(self, rows: List, column_names: List[str]) -> List[Dict[str, Any]]:
+        """Convert query result rows to a list of dicts keyed by column names."""
+        result = []
+        for row in rows:
+            if not row or len(row) < len(column_names):
+                continue
+            result.append(dict(zip(column_names, row)))
+        return result
 
-        This method retrieves all neighboring nodes connected to a specified node and returns
-        them as a list of dictionaries. It may return an empty list if no neighbors exist or an
-        error occurs.
+    @staticmethod
+    def _resolve_edge_object_id(
+        properties: Dict[str, Any], edge_object_id_json: Optional[str]
+    ) -> Optional[str]:
+        """Resolve edge_object_id from properties or from edge_object_id_json string."""
+        edge_object_id = properties.get("edge_object_id")
+        if (not isinstance(edge_object_id, str) or not edge_object_id) and isinstance(
+            edge_object_id_json, str
+        ):
+            try:
+                parsed = json.loads(edge_object_id_json)
+                edge_object_id = parsed if isinstance(parsed, str) else None
+            except (TypeError, json.JSONDecodeError):
+                edge_object_id = None
+        return edge_object_id if isinstance(edge_object_id, str) and edge_object_id else None
 
-        Parameters:
-        -----------
+    _EDGE_BY_OBJECT_ID_COLUMNS = [
+        "from_id",
+        "to_id",
+        "relationship_name",
+        "edge_object_id_json",
+        "properties",
+    ]
 
-            - node_id (str): The identifier of the node for which to find neighbors.
-
-        Returns:
-        --------
-
-            - List[Dict[str, Any]]: A list of dictionaries representing neighboring nodes'
-              properties.
-        """
-        query_str = """
-        MATCH (n)-[r]-(m)
-        WHERE n.id = $id
-        RETURN DISTINCT properties(m)
-        """
-        try:
-            result = await self.query(query_str, {"id": node_id})
-            return [row[0] for row in result] if result else []
-        except Exception as e:
-            logger.error(f"Failed to get neighbours for node {node_id}: {e}")
+    async def _fetch_edge_rows_by_object_ids(
+        self, edge_object_ids: Set[str]
+    ) -> List[Dict[str, Any]]:
+        """Fetch edge rows (as dicts) for the given edge_object_ids."""
+        if not edge_object_ids:
             return []
+        requested_ids_json = [json.dumps(eid) for eid in edge_object_ids]
+        query = """
+        MATCH (from:Node)-[r:EDGE]->(to:Node)
+        WITH from, to, r, CAST(json_extract(r.properties, '$.edge_object_id') AS STRING) AS edge_object_id_json
+        WHERE edge_object_id_json IN $edge_object_ids_json
+        RETURN from.id AS from_id, to.id AS to_id, r.relationship_name AS relationship_name,
+               edge_object_id_json AS edge_object_id_json, r.properties AS properties
+        """
+        rows = await self.query(query, {"edge_object_ids_json": requested_ids_json})
+        return self._rows_to_dicts(rows, self._EDGE_BY_OBJECT_ID_COLUMNS)
+
+    def _build_node_feedback_updates(
+        self,
+        nodes: List[Dict[str, Any]],
+        node_feedback_weights: Dict[str, float],
+    ) -> List[Dict[str, Any]]:
+        """Build UNWIND items for node feedback weight updates."""
+        updates = []
+        for node in nodes:
+            node_id = node.get("id")
+            if not isinstance(node_id, str) or node_id not in node_feedback_weights:
+                continue
+            properties = {
+                k: v
+                for k, v in node.items()
+                if k not in {"id", "name", "type", "created_at", "updated_at"}
+            }
+            properties["feedback_weight"] = float(node_feedback_weights[node_id])
+            updates.append(
+                {"node_id": node_id, "properties": json.dumps(properties, cls=JSONEncoder)}
+            )
+        return updates
+
+    async def _execute_node_feedback_updates(self, updates: List[Dict[str, Any]]) -> Set[str]:
+        """Run node feedback weight UNWIND/SET; return set of updated node_ids."""
+        if not updates:
+            return set()
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")
+        query = """
+        UNWIND $items AS item
+        MATCH (n:Node)
+        WHERE n.id = item.node_id
+        SET n.properties = item.properties,
+            n.updated_at = timestamp($updated_at)
+        RETURN n.id AS node_id
+        """
+        result = await self.query(query, {"items": updates, "updated_at": now})
+        rows_dicts = self._rows_to_dicts(result, ["node_id"])
+        return {str(r["node_id"]) for r in rows_dicts if r.get("node_id") is not None}
+
+    def _build_edge_feedback_updates(
+        self,
+        edge_rows: List[Dict[str, Any]],
+        edge_feedback_weights: Dict[str, float],
+    ) -> List[Dict[str, Any]]:
+        """Build UNWIND items for edge feedback weight updates."""
+        edge_updates = []
+        for row in edge_rows:
+            properties_raw = row.get("properties")
+            if not properties_raw:
+                continue
+            try:
+                properties = json.loads(properties_raw)
+            except (TypeError, json.JSONDecodeError):
+                continue
+            edge_object_id = self._resolve_edge_object_id(
+                properties, row.get("edge_object_id_json")
+            )
+            if not edge_object_id or edge_object_id not in edge_feedback_weights:
+                continue
+            properties["feedback_weight"] = float(edge_feedback_weights[edge_object_id])
+            edge_updates.append(
+                {
+                    "edge_object_id": edge_object_id,
+                    "from_id": str(row.get("from_id")),
+                    "to_id": str(row.get("to_id")),
+                    "relationship_name": str(row.get("relationship_name")),
+                    "properties": json.dumps(properties, cls=JSONEncoder),
+                }
+            )
+        return edge_updates
+
+    async def _execute_edge_feedback_updates(self, edge_updates: List[Dict[str, Any]]) -> Set[str]:
+        """Run edge feedback weight UNWIND/SET; return set of updated edge_object_ids."""
+        if not edge_updates:
+            return set()
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")
+        query = """
+        UNWIND $items AS item
+        MATCH (from:Node)-[r:EDGE]->(to:Node)
+        WHERE from.id = item.from_id
+          AND to.id = item.to_id
+          AND r.relationship_name = item.relationship_name
+        SET r.properties = item.properties,
+            r.updated_at = timestamp($updated_at)
+        RETURN item.edge_object_id AS edge_object_id
+        """
+        result = await self.query(query, {"items": edge_updates, "updated_at": now})
+        rows_dicts = self._rows_to_dicts(result, ["edge_object_id"])
+        return {str(r["edge_object_id"]) for r in rows_dicts if r.get("edge_object_id") is not None}
+
+    async def get_node_feedback_weights(self, node_ids: List[str]) -> Dict[str, float]:
+        if not node_ids:
+            return {}
+        valid_node_ids = [node_id for node_id in node_ids if isinstance(node_id, str) and node_id]
+        if not valid_node_ids:
+            return {}
+        nodes = await self.get_nodes(valid_node_ids)
+        result: Dict[str, float] = {}
+        for node in nodes:
+            node_id = node.get("id")
+            if not isinstance(node_id, str):
+                continue
+            value = node.get("feedback_weight", 0.5)
+            try:
+                result[node_id] = float(value)
+            except (TypeError, ValueError):
+                result[node_id] = 0.5
+        return result
+
+    async def set_node_feedback_weights(
+        self, node_feedback_weights: Dict[str, float]
+    ) -> Dict[str, bool]:
+        if not node_feedback_weights:
+            return {}
+        node_ids = list(node_feedback_weights.keys())
+        valid_node_ids = [nid for nid in node_ids if isinstance(nid, str) and nid]
+        if not valid_node_ids:
+            return {nid: False for nid in node_ids}
+        nodes = await self.get_nodes(valid_node_ids)
+        updates = self._build_node_feedback_updates(nodes, node_feedback_weights)
+        if not updates:
+            return {nid: False for nid in node_ids}
+        updated_ids = await self._execute_node_feedback_updates(updates)
+        return {nid: (nid in updated_ids) for nid in node_ids}
+
+    async def get_edge_feedback_weights(self, edge_object_ids: List[str]) -> Dict[str, float]:
+        if not edge_object_ids:
+            return {}
+        requested_ids = {eid for eid in edge_object_ids if isinstance(eid, str) and eid}
+        if not requested_ids:
+            return {}
+        edge_rows = await self._fetch_edge_rows_by_object_ids(requested_ids)
+        result: Dict[str, float] = {}
+        for row in edge_rows:
+            properties_raw = row.get("properties")
+            if not properties_raw:
+                continue
+            try:
+                properties = json.loads(properties_raw)
+            except (TypeError, json.JSONDecodeError):
+                continue
+            edge_object_id = self._resolve_edge_object_id(
+                properties, row.get("edge_object_id_json")
+            )
+            if not edge_object_id or edge_object_id not in requested_ids:
+                continue
+            value = properties.get("feedback_weight", 0.5)
+            try:
+                result[edge_object_id] = float(value)
+            except (TypeError, ValueError):
+                result[edge_object_id] = 0.5
+        return result
+
+    async def set_edge_feedback_weights(
+        self, edge_feedback_weights: Dict[str, float]
+    ) -> Dict[str, bool]:
+        if not edge_feedback_weights:
+            return {}
+        requested_ids = {eid for eid in edge_feedback_weights if isinstance(eid, str) and eid}
+        if not requested_ids:
+            return {eid: False for eid in edge_feedback_weights}
+        edge_rows = await self._fetch_edge_rows_by_object_ids(requested_ids)
+        edge_updates = self._build_edge_feedback_updates(edge_rows, edge_feedback_weights)
+        if not edge_updates:
+            return {eid: False for eid in edge_feedback_weights}
+        updated_ids = await self._execute_edge_feedback_updates(edge_updates)
+        return {eid: (eid in updated_ids) for eid in edge_feedback_weights}
 
     async def get_predecessors(
         self, node_id: Union[str, UUID], edge_label: Optional[str] = None
@@ -1016,6 +1403,11 @@ class KuzuAdapter(GraphDBInterface):
               A tuple with two elements: a list of tuples of (node_id, properties) and a list of
               tuples of (source_id, target_id, relationship_name, properties).
         """
+
+        import time
+
+        start_time = time.time()
+
         try:
             nodes_query = """
             MATCH (n:Node)
@@ -1044,7 +1436,7 @@ class KuzuAdapter(GraphDBInterface):
                 return [], []
 
             edges_query = """
-            MATCH (n:Node)-[r:EDGE]->(m:Node)
+            MATCH (n:Node)-[r]->(m:Node)
             RETURN n.id, m.id, r.relationship_name, r.properties
             """
             edges = await self.query(edges_query)
@@ -1079,13 +1471,118 @@ class KuzuAdapter(GraphDBInterface):
                             },
                         )
                     )
+
+            retrieval_time = time.time() - start_time
+            logger.info(
+                f"Retrieved {len(nodes)} nodes and {len(edges)} edges in {retrieval_time:.2f} seconds"
+            )
             return formatted_nodes, formatted_edges
         except Exception as e:
             logger.error(f"Failed to get graph data: {e}")
             raise
 
+    async def get_neighborhood(
+        self,
+        node_ids: List[str],
+        depth: int = 1,
+        edge_types: Optional[List[str]] = None,
+    ) -> Tuple[List[Tuple[str, Dict[str, Any]]], List[Tuple[str, str, str, Dict[str, Any]]]]:
+        """
+        Get the k-hop neighborhood subgraph around a set of seed nodes.
+
+        Returns all nodes and edges within `depth` hops of any seed node,
+        in the same format as get_graph_data().
+        """
+        import time
+
+        start_time = time.time()
+
+        try:
+            if not node_ids:
+                logger.warning("No node IDs provided for neighborhood retrieval.")
+                return [], []
+
+            # Use variable-length path to find all nodes within depth hops
+            path_query = f"""
+            MATCH (seed:Node)-[r*1..{depth}]-(neighbor:Node)
+            WHERE seed.id IN $node_ids{" AND ALL(rel IN r WHERE rel.relationship_name IN $edge_types)" if edge_types else ""}
+            RETURN DISTINCT neighbor.id
+            """
+            params = {"node_ids": node_ids}
+            if edge_types:
+                params["edge_types"] = edge_types
+
+            neighbor_rows = await self.query(path_query, params)
+            neighbor_ids = [row[0] for row in neighbor_rows if row[0]]
+
+            # Combine seed nodes and neighbor nodes
+            all_ids = list(set(node_ids) | set(neighbor_ids))
+
+            # Fetch all nodes
+            nodes_query = """
+            MATCH (n:Node)
+            WHERE n.id IN $ids
+            RETURN n.id, {
+                name: n.name,
+                type: n.type,
+                properties: n.properties
+            }
+            """
+            node_rows = await self.query(nodes_query, {"ids": all_ids})
+            formatted_nodes = []
+            for n in node_rows:
+                if n[0]:
+                    node_id = str(n[0])
+                    props = n[1]
+                    if props.get("properties"):
+                        try:
+                            additional_props = json.loads(props["properties"])
+                            props.update(additional_props)
+                            del props["properties"]
+                        except json.JSONDecodeError:
+                            logger.warning(f"Failed to parse properties JSON for node {node_id}")
+                    formatted_nodes.append((node_id, props))
+
+            if not formatted_nodes:
+                logger.warning("No nodes found in neighborhood.")
+                return [], []
+
+            # Fetch all edges between the collected nodes
+            edges_query = """
+            MATCH (n:Node)-[r]->(m:Node)
+            WHERE n.id IN $ids AND m.id IN $ids
+            RETURN n.id, m.id, r.relationship_name, r.properties
+            """
+            edge_rows = await self.query(edges_query, {"ids": all_ids})
+            formatted_edges = []
+            for e in edge_rows:
+                if e and len(e) >= 3:
+                    source_id = str(e[0])
+                    target_id = str(e[1])
+                    rel_type = str(e[2])
+                    props = {}
+                    if len(e) > 3 and e[3]:
+                        try:
+                            props = json.loads(e[3])
+                        except (json.JSONDecodeError, TypeError):
+                            logger.warning(
+                                f"Failed to parse edge properties for {source_id}->{target_id}"
+                            )
+                    formatted_edges.append((source_id, target_id, rel_type, props))
+
+            retrieval_time = time.time() - start_time
+            logger.info(
+                f"Neighborhood retrieval ({depth}-hop): {len(formatted_nodes)} nodes and "
+                f"{len(formatted_edges)} edges in {retrieval_time:.2f}s"
+            )
+            return formatted_nodes, formatted_edges
+
+        except Exception as e:
+            logger.error(f"Failed to get neighborhood: {e}")
+            raise
+
     async def get_nodeset_subgraph(
-        self, node_type: Type[Any], node_name: List[str]
+        self, node_type: Type[Any], node_name: List[str], node_name_filter_operator: str = "OR"
     ) -> Tuple[List[Tuple[str, dict]], List[Tuple[str, str, str, dict]]]:
         """
         Get subgraph for a set of nodes based on type and names.
@@ -1118,12 +1615,24 @@ class KuzuAdapter(GraphDBInterface):
         if not primary_ids:
             return [], []
 
-        neighbor_query = """
-            MATCH (n:Node)-[:EDGE]-(nbr:Node)
-            WHERE n.id IN $ids
-            RETURN DISTINCT nbr.id
-        """
-        nbr_rows = await self.query(neighbor_query, {"ids": primary_ids})
+        if node_name_filter_operator == "OR":
+            neighbor_query = """
+                MATCH (n:Node)-[:EDGE]-(nbr:Node)
+                WHERE n.id IN $ids
+                RETURN DISTINCT nbr.id
+            """
+            params = {"ids": primary_ids}
+        else:
+            neighbor_query = """
+                MATCH (n:Node)-[:EDGE]-(nbr:Node)
+                WHERE n.id IN $ids
+                WITH nbr.id AS nbr_id, COUNT(DISTINCT n.id) AS matched_count
+                WHERE matched_count = $primary_count
+                RETURN nbr_id
+            """
+            params = {"ids": primary_ids, "primary_count": len(primary_ids)}
+
+        nbr_rows = await self.query(neighbor_query, params)
         neighbor_ids = [row[0] for row in nbr_rows]
 
         all_ids = list({*primary_ids, *neighbor_ids})
@@ -1158,6 +1667,7 @@ class KuzuAdapter(GraphDBInterface):
                     data = json.loads(props)
                 except json.JSONDecodeError:
                     logger.warning(f"Failed to parse JSON props for edge {from_id}->{to_id}")
+
             edges.append((from_id, to_id, rel_type, data))
 
         return nodes, edges
@@ -1185,7 +1695,6 @@ class KuzuAdapter(GraphDBInterface):
             A tuple containing a list of filtered node properties and a list of filtered edge
             properties.
         """
-
         where_clauses = []
         params = {}
 
@@ -1196,16 +1705,142 @@ class KuzuAdapter(GraphDBInterface):
                 params[param_name] = values
 
         where_clause = " AND ".join(where_clauses)
-        nodes_query = f"MATCH (n:Node) WHERE {where_clause} RETURN properties(n)"
+        nodes_query = f"""
+        MATCH (n:Node)
+        WHERE {where_clause}
+        RETURN n.id, {{
+            name: n.name,
+            type: n.type,
+            properties: n.properties
+        }}
+        """
         edges_query = f"""
         MATCH (n1:Node)-[r:EDGE]->(n2:Node)
         WHERE {where_clause.replace("n.", "n1.")} AND {where_clause.replace("n.", "n2.")}
-        RETURN properties(r)
+        RETURN n1.id, n2.id, r.relationship_name, r.properties
         """
         nodes, edges = await asyncio.gather(
             self.query(nodes_query, params), self.query(edges_query, params)
         )
-        return ([n[0] for n in nodes], [e[0] for e in edges])
+        formatted_nodes = []
+        for n in nodes:
+            if n[0]:
+                node_id = str(n[0])
+                props = n[1]
+                if props.get("properties"):
+                    try:
+                        additional_props = json.loads(props["properties"])
+                        props.update(additional_props)
+                        del props["properties"]
+                    except json.JSONDecodeError:
+                        logger.warning(f"Failed to parse properties JSON for node {node_id}")
+                formatted_nodes.append((node_id, props))
+        if not formatted_nodes:
+            logger.warning("No nodes found in the database")
+            return [], []
+
+        formatted_edges = []
+        for e in edges:
+            if e and len(e) >= 3:
+                source_id = str(e[0])
+                target_id = str(e[1])
+                rel_type = str(e[2])
+                props = {}
+                if len(e) > 3 and e[3]:
+                    try:
+                        props = json.loads(e[3])
+                    except (json.JSONDecodeError, TypeError):
+                        logger.warning(
+                            f"Failed to parse edge properties for {source_id}->{target_id}"
+                        )
+                formatted_edges.append((source_id, target_id, rel_type, props))
+        return formatted_nodes, formatted_edges
+
+    async def get_id_filtered_graph_data(self, target_ids: list[str]):
+        """
+        Retrieve graph data filtered by specific node IDs, including their direct neighbors
+        and only edges where one endpoint matches those IDs.
+
+        Returns:
+            nodes: List[dict]   -> Each dict includes "id" and all node properties
+            edges: List[dict]   -> Each dict includes "source", "target", "type", "properties"
+        """
+        import time
+
+        start_time = time.time()
+
+        try:
+            if not target_ids:
+                logger.warning("No target IDs provided for ID-filtered graph retrieval.")
+                return [], []
+
+            if not all(isinstance(x, str) for x in target_ids):
+                raise CogneeValidationError("target_ids must be a list of strings")
+
+            query = """
+            MATCH (n:Node)-[r]->(m:Node)
+            WHERE n.id IN $target_ids OR m.id IN $target_ids
+            RETURN n.id, {
+                name: n.name,
+                type: n.type,
+                properties: n.properties
+            }, m.id, {
+                name: m.name,
+                type: m.type,
+                properties: m.properties
+            }, r.relationship_name, r.properties
+            """
+
+            result = await self.query(query, {"target_ids": target_ids})
+
+            if not result:
+                logger.info("No data returned for the supplied IDs")
+                return [], []
+
+            nodes_dict = {}
+            edges = []
+
+            for n_id, n_props, m_id, m_props, r_type, r_props_raw in result:
+                if n_props.get("properties"):
+                    try:
+                        additional_props = json.loads(n_props["properties"])
+                        n_props.update(additional_props)
+                        del n_props["properties"]
+                    except json.JSONDecodeError:
+                        logger.warning(f"Failed to parse properties JSON for node {n_id}")
+
+                if m_props.get("properties"):
+                    try:
+                        additional_props = json.loads(m_props["properties"])
+                        m_props.update(additional_props)
+                        del m_props["properties"]
+                    except json.JSONDecodeError:
+                        logger.warning(f"Failed to parse properties JSON for node {m_id}")
+
+                nodes_dict[n_id] = (n_id, n_props)
+                nodes_dict[m_id] = (m_id, m_props)
+
+                edge_props = {}
+                if r_props_raw:
+                    try:
+                        edge_props = json.loads(r_props_raw)
+                    except (json.JSONDecodeError, TypeError):
+                        logger.warning(f"Failed to parse edge properties for {n_id}->{m_id}")
+
+                source_id = edge_props.get("source_node_id", n_id)
+                target_id = edge_props.get("target_node_id", m_id)
+                edges.append((source_id, target_id, r_type, edge_props))
+
+            retrieval_time = time.time() - start_time
+            logger.info(
+                f"ID-filtered retrieval: {len(nodes_dict)} nodes and {len(edges)} edges in {retrieval_time:.2f}s"
+            )
+
+            return list(nodes_dict.values()), edges
+
+        except Exception as e:
+            logger.error(f"Error during ID-filtered graph data retrieval: {str(e)}")
+            raise
 
     async def get_graph_metrics(self, include_optional=False) -> Dict[str, Any]:
         """
@@ -1383,140 +2018,38 @@ class KuzuAdapter(GraphDBInterface):
             "relationship_types": [rel[0] for rel in rel_types],
         }
 
-    async def get_node_labels_string(self) -> str:
-        """
-        Get all node labels as a string.
-
-        This method aggregates all unique node labels from the graph into a single string
-        representation, which can be helpful for overview and debugging purposes.
-
-        Returns:
-        --------
-
-            - str: A string of all distinct node labels, separated by '|'.
-        """
-        labels = await self.query("MATCH (n:Node) RETURN DISTINCT labels(n)")
-        return "|".join(sorted(set([label[0] for label in labels])))
-
-    async def get_relationship_labels_string(self) -> str:
-        """
-        Get all relationship types as a string.
-
-        This method aggregates all unique relationship types from the graph into a single string
-        representation, providing an overview of the relationships defined in the graph.
-
-        Returns:
-        --------
-
-            - str: A string of all distinct relationship types, separated by '|'.
-        """
-        types = await self.query("MATCH ()-[r:EDGE]->() RETURN DISTINCT r.relationship_name")
-        return "|".join(sorted(set([t[0] for t in types])))
-
     async def delete_graph(self) -> None:
         """
-        Delete all data from the graph while preserving the database structure.
+        Delete all data from the graph database.
 
-        This method removes all nodes and relationships from the graph but maintains the
-        underlying database for future use. It raises exceptions for failures occurring during
-        deletion processes.
-        """
-        try:
-            # Use DETACH DELETE to remove both nodes and their relationships in one operation
-            await self.query("MATCH (n:Node) DETACH DELETE n")
-            logger.info("Cleared all data from graph while preserving structure")
-        except Exception as e:
-            logger.error(f"Failed to delete graph data: {e}")
-            raise
-
-    async def clear_database(self) -> None:
-        """
-        Clear all data from the database by deleting the database files and reinitializing.
-
-        This method removes all files associated with the database and reinitializes the Kuzu
-        database structure, ensuring a completely empty state. It handles exceptions that might
-        occur during file deletions or initializations carefully.
+        This method deletes all nodes and relationships from the graph database.
+        It raises exceptions for failures occurring during deletion processes.
         """
         try:
             if self.connection:
+                self.connection.close()
                 self.connection = None
             if self.db:
                 self.db.close()
                 self.db = None
-            if os.path.exists(self.db_path):
-                shutil.rmtree(self.db_path)
-                logger.info(f"Deleted Kuzu database files at {self.db_path}")
-            # Reinitialize the database
-            self._initialize_connection()
-            # Verify the database is empty
-            result = self.connection.execute("MATCH (n:Node) RETURN COUNT(n)")
-            count = result.get_next()[0] if result.has_next() else 0
-            if count > 0:
-                logger.warning(
-                    f"Database still contains {count} nodes after clearing, forcing deletion"
-                )
-                self.connection.execute("MATCH (n:Node) DETACH DELETE n")
-            logger.info("Database cleared successfully")
-        except Exception as e:
-            logger.error(f"Error during database clearing: {e}")
-            raise
 
-    async def save_graph_to_file(self, file_path: str) -> None:
-        """
-        Export the Kuzu database to a file.
+            db_dir = os.path.dirname(self.db_path)
+            db_name = os.path.basename(self.db_path)
+            file_storage = get_file_storage(db_dir)
 
-        This method exports the entire Kuzu graph database to a specified file path, utilizing
-        Kuzu's native export command. Ensure the directory exists prior to attempting the
-        export, and manage related exceptions as they arise.
+            if await file_storage.is_file(db_name):
+                await file_storage.remove(db_name)
+                await file_storage.remove(f"{db_name}.lock")
+            else:
+                await file_storage.remove_all(db_name)
 
-        Parameters:
-        -----------
-
-            - file_path (str): Path where to export the database.
-        """
-        try:
-            # Ensure directory exists
-            os.makedirs(os.path.dirname(file_path), exist_ok=True)
-
-            # Use Kuzu's native EXPORT command, output is Parquet
-            export_query = f"EXPORT DATABASE '{file_path}'"
-            await self.query(export_query)
-
-            logger.info(f"Graph exported to {file_path}")
+            logger.info(f"Deleted Kuzu database files at {self.db_path}")
 
         except Exception as e:
-            logger.error(f"Failed to export graph to file: {e}")
+            logger.error(f"Failed to delete graph data: {e}")
             raise
 
-    async def load_graph_from_file(self, file_path: str) -> None:
-        """
-        Import a Kuzu database from a file.
-
-        This method imports a database from a specified file path, ensuring that the file exists
-        before attempting to import. Errors during the import process are managed accordingly,
-        allowing for smooth operation.
-
-        Parameters:
-        -----------
-
-            - file_path (str): Path to the exported database file.
-        """
-        try:
-            if not os.path.exists(file_path):
-                logger.warning(f"File {file_path} not found")
-                return
-
-            # Use Kuzu's native IMPORT command
-            import_query = f"IMPORT DATABASE '{file_path}'"
-            await self.query(import_query)
-
-            logger.info(f"Graph imported from {file_path}")
-
-        except Exception as e:
-            logger.error(f"Failed to import graph from file: {e}")
-            raise
-
-    async def get_document_subgraph(self, content_hash: str):
+    async def get_document_subgraph(self, data_id: str):
         """
         Get all nodes that should be deleted when removing a document.
 
@@ -1527,7 +2060,7 @@ class KuzuAdapter(GraphDBInterface):
         Parameters:
         -----------
 
-            - content_hash (str): The identifier for the document to query against.
+            - data_id (str): The identifier for the document to query against.
 
         Returns:
         --------
@@ -1537,7 +2070,7 @@ class KuzuAdapter(GraphDBInterface):
         """
         query = """
         MATCH (doc:Node)
-        WHERE (doc.type = 'TextDocument' OR doc.type = 'PdfDocument') AND doc.name = $content_hash
+        WHERE (doc.type = 'TextDocument' OR doc.type = 'PdfDocument' OR doc.type = 'AudioDocument' OR doc.type = 'ImageDocument' OR doc.type = 'UnstructuredDocument') AND doc.id = $data_id
 
         OPTIONAL MATCH (doc)<-[e1:EDGE]-(chunk:Node)
         WHERE e1.relationship_name = 'is_part_of' AND chunk.type = 'DocumentChunk'
@@ -1548,7 +2081,7 @@ class KuzuAdapter(GraphDBInterface):
             MATCH (entity)<-[e3:EDGE]-(otherChunk:Node)-[e4:EDGE]->(otherDoc:Node)
             WHERE e3.relationship_name = 'contains'
             AND e4.relationship_name = 'is_part_of'
-            AND (otherDoc.type = 'TextDocument' OR otherDoc.type = 'PdfDocument')
+            AND (otherDoc.type = 'TextDocument' OR otherDoc.type = 'PdfDocument' OR otherDoc.type = 'AudioDocument' OR otherDoc.type = 'ImageDocument' OR otherDoc.type = 'UnstructuredDocument')
             AND otherDoc.id <> doc.id
         }
 
@@ -1564,7 +2097,7 @@ class KuzuAdapter(GraphDBInterface):
             AND e9.relationship_name = 'is_part_of'
             AND otherEntity.type = 'Entity'
             AND otherChunk.type = 'DocumentChunk'
-            AND (otherDoc.type = 'TextDocument' OR otherDoc.type = 'PdfDocument')
+            AND (otherDoc.type = 'TextDocument' OR otherDoc.type = 'PdfDocument' OR otherDoc.type = 'AudioDocument' OR otherDoc.type = 'ImageDocument' OR otherDoc.type = 'UnstructuredDocument')
             AND otherDoc.id <> doc.id
         }
 
@@ -1575,7 +2108,7 @@ class KuzuAdapter(GraphDBInterface):
             COLLECT(DISTINCT made_node) as made_from_nodes,
             COLLECT(DISTINCT type) as orphan_types
         """
-        result = await self.query(query, {"content_hash": f"text_{content_hash}"})
+        result = await self.query(query, {"data_id": f"{data_id}"})
         if not result or not result[0]:
             return None
 
@@ -1618,3 +2151,255 @@ class KuzuAdapter(GraphDBInterface):
         """
         result = await self.query(query)
         return [record[0] for record in result] if result else []
+
+    async def collect_events(self, ids: List[str]) -> Any:
+        """
+        Collect all Event-type nodes reachable within 1..2 hops
+        from the given node IDs.
+
+        Args:
+            graph_engine: Object exposing an async .query(str) -> Any
+            ids: List of node IDs (strings)
+
+        Returns:
+            List of events
+        """
+
+        event_collection_cypher = """UNWIND [{quoted}] AS uid
+            MATCH (start {{id: uid}})
+            MATCH (start)-[*1..2]-(event)
+            WHERE event.type = 'Event'
+            WITH DISTINCT event
+            RETURN collect(event) AS events;
+        """
+
+        query = event_collection_cypher.format(quoted=ids)
+        result = await self.query(query)
+        events = []
+        for node in result[0][0]:
+            props = json.loads(node["properties"])
+
+            event = {
+                "id": node["id"],
+                "name": node["name"],
+                "description": props.get("description"),
+            }
+
+            if props.get("location"):
+                event["location"] = props["location"]
+
+            events.append(event)
+
+        return [{"events": events}]
+
+    async def collect_time_ids(
+        self,
+        time_from: Optional[Timestamp] = None,
+        time_to: Optional[Timestamp] = None,
+    ) -> str:
+        """
+        Collect IDs of Timestamp nodes between time_from and time_to.
+
+        Args:
+            graph_engine: Object exposing an async .query(query, params) -> list[dict]
+            time_from: Lower bound int (inclusive), optional
+            time_to: Upper bound int (inclusive), optional
+
+        Returns:
+            A string of quoted IDs:  "'id1', 'id2', 'id3'"
+            (ready for use in a Cypher UNWIND clause).
+        """
+
+        ids: List[str] = []
+
+        if time_from and time_to:
+            time_from = date_to_int(time_from)
+            time_to = date_to_int(time_to)
+
+            cypher = f"""
+            MATCH (n:Node)
+            WHERE n.type = 'Timestamp'
+            // Extract time_at from the JSON string and cast to INT64
+            WITH n, json_extract(n.properties, '$.time_at') AS t_str
+            WITH n,
+                 CASE
+                   WHEN t_str IS NULL OR t_str = '' THEN NULL
+                   ELSE CAST(t_str AS INT64)
+                 END AS t
+            WHERE t >= {time_from}
+            AND t <= {time_to}
+            RETURN n.id as id
+            """
+
+        elif time_from:
+            time_from = date_to_int(time_from)
+
+            cypher = f"""
+            MATCH (n:Node)
+            WHERE n.type = 'Timestamp'
+            // Extract time_at from the JSON string and cast to INT64
+            WITH n, json_extract(n.properties, '$.time_at') AS t_str
+            WITH n,
+                 CASE
+                   WHEN t_str IS NULL OR t_str = '' THEN NULL
+                   ELSE CAST(t_str AS INT64)
+                 END AS t
+            WHERE t >= {time_from}
+            RETURN n.id as id
+            """
+
+        elif time_to:
+            time_to = date_to_int(time_to)
+
+            cypher = f"""
+            MATCH (n:Node)
+            WHERE n.type = 'Timestamp'
+            // Extract time_at from the JSON string and cast to INT64
+            WITH n, json_extract(n.properties, '$.time_at') AS t_str
+            WITH n,
+                 CASE
+                   WHEN t_str IS NULL OR t_str = '' THEN NULL
+                   ELSE CAST(t_str AS INT64)
+                 END AS t
+            WHERE t <= {time_to}
+            RETURN n.id as id
+            """
+
+        else:
+            return ids
+
+        time_nodes = await self.query(cypher)
+        time_ids_list = [item[0] for item in time_nodes]
+
+        return ", ".join(f"'{uid}'" for uid in time_ids_list)
+
+    async def get_triplets_batch(self, offset: int, limit: int) -> list[dict[str, Any]]:
+        """
+        Retrieve a batch of triplets (start_node, relationship, end_node) from the graph.
+
+        Parameters:
+        -----------
+            - offset (int): Number of triplets to skip before returning results.
+            - limit (int): Maximum number of triplets to return.
+
+        Returns:
+        --------
+            - list[dict[str, Any]]: A list of triplets, where each triplet is a dictionary
+              with keys: 'start_node', 'relationship_properties', 'end_node'.
+
+        Raises:
+        -------
+            - ValueError: If offset or limit are negative.
+            - Exception: Re-raises any exceptions from query execution.
+        """
+        if offset < 0:
+            raise ValueError(f"Offset must be non-negative, got {offset}")
+        if limit < 0:
+            raise ValueError(f"Limit must be non-negative, got {limit}")
+
+        query = """
+        MATCH (start_node:Node)-[relationship:EDGE]->(end_node:Node)
+        RETURN {
+            start_node: {
+                id: start_node.id,
+                name: start_node.name,
+                type: start_node.type,
+                properties: start_node.properties
+            },
+            relationship_properties: {
+                relationship_name: relationship.relationship_name,
+                properties: relationship.properties
+            },
+            end_node: {
+                id: end_node.id,
+                name: end_node.name,
+                type: end_node.type,
+                properties: end_node.properties
+            }
+        } AS triplet
+        SKIP $offset LIMIT $limit
+        """
+
+        try:
+            results = await self.query(query, {"offset": offset, "limit": limit})
+        except Exception as e:
+            logger.error(f"Failed to execute triplet query: {str(e)}")
+            logger.error(f"Query: {query}")
+            logger.error(f"Parameters: offset={offset}, limit={limit}")
+            raise
+
+        triplets = []
+        for idx, row in enumerate(results):
+            try:
+                if not row or len(row) == 0:
+                    logger.warning(f"Skipping empty row at index {idx} in triplet batch")
+                    continue
+
+                if not isinstance(row[0], dict):
+                    logger.warning(
+                        f"Skipping invalid row at index {idx}: expected dict, got {type(row[0])}"
+                    )
+                    continue
+
+                triplet = row[0]
+
+                if "start_node" not in triplet:
+                    logger.warning(f"Skipping triplet at index {idx}: missing 'start_node' key")
+                    continue
+
+                if not isinstance(triplet["start_node"], dict):
+                    logger.warning(f"Skipping triplet at index {idx}: 'start_node' is not a dict")
+                    continue
+
+                triplet["start_node"] = self._parse_node_properties(triplet["start_node"].copy())
+
+                if "relationship_properties" not in triplet:
+                    logger.warning(
+                        f"Skipping triplet at index {idx}: missing 'relationship_properties' key"
+                    )
+                    continue
+
+                if not isinstance(triplet["relationship_properties"], dict):
+                    logger.warning(
+                        f"Skipping triplet at index {idx}: 'relationship_properties' is not a dict"
+                    )
+                    continue
+
+                rel_props = triplet["relationship_properties"].copy()
+                relationship_name = rel_props.get("relationship_name") or ""
+
+                if rel_props.get("properties"):
+                    try:
+                        parsed_props = json.loads(rel_props["properties"])
+                        if isinstance(parsed_props, dict):
+                            rel_props.update(parsed_props)
+                            del rel_props["properties"]
+                        else:
+                            logger.warning(
+                                f"Parsed relationship properties is not a dict for triplet at index {idx}"
+                            )
+                    except (json.JSONDecodeError, TypeError) as e:
+                        logger.warning(
+                            f"Failed to parse relationship properties JSON for triplet at index {idx}: {e}"
+                        )
+
+                rel_props["relationship_name"] = relationship_name
+                triplet["relationship_properties"] = rel_props
+
+                if "end_node" not in triplet:
+                    logger.warning(f"Skipping triplet at index {idx}: missing 'end_node' key")
+                    continue
+
+                if not isinstance(triplet["end_node"], dict):
+                    logger.warning(f"Skipping triplet at index {idx}: 'end_node' is not a dict")
+                    continue
+
+                triplet["end_node"] = self._parse_node_properties(triplet["end_node"].copy())
+
+                triplets.append(triplet)
+
+            except Exception as e:
+                logger.error(f"Error processing triplet at index {idx}: {e}", exc_info=True)
+                continue
+
+        return triplets

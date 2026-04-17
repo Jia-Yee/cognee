@@ -1,22 +1,25 @@
 [project]
 name = "cognee-mcp"
-version = "0.3.0"
-description = "A MCP server project"
+version = "0.5.3"
+description = "Cognee MCP server"
 readme = "README.md"
 requires-python = ">=3.10"
 
 dependencies = [
-    # For local cognee repo usage remove comment bellow and add absolute path to cognee
-    #"cognee[postgres,codegraph,gemini,huggingface] @ file:/Users/<username>/Desktop/cognee",
-    "cognee[postgres,codegraph,gemini,huggingface,docs,neo4j]==0.1.40",
-    "fastmcp>=1.0",
-    "mcp==1.5.0",
-    "uv>=0.6.3",
+    # For local cognee repo usage remove comment bellow and add absolute path to cognee. Then run `uv sync --reinstall` in the mcp folder on local cognee changes.
+    #"cognee[postgres,docs,neo4j] @ file:/Users/igorilic/Desktop/cognee",
+    "cognee[postgres,docs,neo4j]==0.5.5",
+    "fastmcp>=3.2.0",
+    "mcp>=1.12.0,<2.0.0",
+    "uv>=0.6.3,<1.0.0",
+    "httpx>=0.27.0,<1.0.0",
 ]
 
-[[project.authors]]
-name = "Boris Arzentar"
-email = "boris@topoteretes.com"
+authors = [
+    { name = "Boris Arzentar", email = "boris@topoteretes.com" },
+    { name = "Igor Ilic", email = "igor@topoteretes.com" },
+    { name = "Laszlo Hajdu", email = "laszlo@topoteretes.com" },
+]
 
 [build-system]
 requires = [ "hatchling", ]
@@ -27,7 +30,13 @@ packages = ["src"]
 
 [dependency-groups]
 dev = [
-    "debugpy>=1.8.12",
+    "debugpy>=1.8.12,<2.0.0",
+]
+
+postgres-binary = [
+    "psycopg2-binary>=2.9.10,<3.0.0",
+    "pgvector>=0.3.5,<0.4",
+    "asyncpg>=0.30.0,<1.0.0",
 ]
 
 [tool.hatch.metadata]
@@ -35,3 +44,4 @@ allow-direct-references = true
 
 [project.scripts]
 cognee = "src:main"
+cognee-mcp = "src:main_mcp"

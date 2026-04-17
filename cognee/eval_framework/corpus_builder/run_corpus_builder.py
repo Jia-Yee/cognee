@@ -2,7 +2,7 @@ from cognee.shared.logging_utils import get_logger, ERROR
 import json
 from typing import List, Optional
 
-from cognee.infrastructure.files.storage import LocalStorage
+from cognee.infrastructure.files.storage import get_file_storage
 from cognee.eval_framework.corpus_builder.corpus_builder_executor import CorpusBuilderExecutor
 from cognee.modules.data.models.questions_base import QuestionsBase
 from cognee.modules.data.models.questions_data import Questions
@@ -21,7 +21,7 @@ async def create_and_insert_questions_table(questions_payload):
     relational_engine = get_relational_engine()
 
     if relational_engine.engine.dialect.name == "sqlite":
-        LocalStorage.ensure_directory_exists(relational_config.db_path)
+        await get_file_storage(relational_config.db_path).ensure_directory_exists()
 
     async with relational_engine.engine.begin() as connection:
         if len(QuestionsBase.metadata.tables.keys()) > 0:
@@ -47,8 +47,16 @@ async def run_corpus_builder(
         except KeyError:
             raise ValueError(f"Invalid task getter type: {params.get('task_getter_type')}")
 
+        # Allow passing a pre-configured adapter instance (e.g., BEAM with max_batches)
+        benchmark_arg = params["benchmark"]
+        beam_max_batches = params.get("_beam_max_batches")
+        if benchmark_arg == "BEAM" and beam_max_batches is not None:
+            from cognee.eval_framework.benchmark_adapters.beam_adapter import BEAMAdapter
+
+            benchmark_arg = BEAMAdapter(max_batches=beam_max_batches)
+
         corpus_builder = CorpusBuilderExecutor(
-            benchmark=params["benchmark"],
+            benchmark=benchmark_arg,
             task_getter=task_getter,
         )
         questions = await corpus_builder.build_corpus(

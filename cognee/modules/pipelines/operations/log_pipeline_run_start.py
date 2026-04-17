@@ -1,11 +1,15 @@
-from uuid import UUID, uuid4
+from uuid import UUID
 from cognee.infrastructure.databases.relational import get_relational_engine
 from cognee.modules.data.models import Data
 from cognee.modules.pipelines.models import PipelineRun, PipelineRunStatus
 from typing import Any
 
+from cognee.modules.pipelines.utils import generate_pipeline_run_id
 
-async def log_pipeline_run_start(pipeline_id: str, pipeline_name: str, dataset_id: UUID, data: Any):
+
+async def log_pipeline_run_start(
+    pipeline_id: UUID, pipeline_name: str, dataset_id: UUID, data: Any
+):
     if not data:
         data_info = "None"
     elif isinstance(data, list) and all(isinstance(item, Data) for item in data):
@@ -13,7 +17,7 @@ async def log_pipeline_run_start(pipeline_id: str, pipeline_name: str, dataset_i
     else:
         data_info = str(data)
 
-    pipeline_run_id = uuid4()
+    pipeline_run_id = generate_pipeline_run_id(pipeline_id, dataset_id)
 
     pipeline_run = PipelineRun(
         pipeline_run_id=pipeline_run_id,

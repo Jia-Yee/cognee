@@ -1,7 +1,8 @@
-import json
 import pathlib
 import os
 from cognee.infrastructure.databases.graph import get_graph_engine
+from cognee.modules.data.methods.create_authorized_dataset import create_authorized_dataset
+from cognee.modules.users.methods import get_default_user
 from cognee.infrastructure.databases.relational import (
     get_migration_relational_engine,
     create_db_and_tables as create_relational_db_and_tables,
@@ -12,6 +13,8 @@ from cognee.infrastructure.databases.vector.pgvector import (
 from cognee.tasks.ingestion import migrate_relational_database
 from cognee.modules.search.types import SearchType
 import cognee
+
+TEST_DATASET_NAME = "migration_test_dataset"
 
 
 def nodes_dict(nodes):
@@ -27,6 +30,9 @@ def normalize_node_name(node_name: str) -> str:
 
 
 async def setup_test_db():
+    # Disable backend access control to migrate relational data
+    os.environ["ENABLE_BACKEND_ACCESS_CONTROL"] = "false"
+
     await cognee.prune.prune_data()
     await cognee.prune.prune_system(metadata=True)
 
@@ -44,9 +50,15 @@ async def relational_db_migration():
     graph_engine = await get_graph_engine()
     await migrate_relational_database(graph_engine, schema=schema)
 
+    # Create the dataset so search can find it by name
+    user = await get_default_user()
+    await create_authorized_dataset(TEST_DATASET_NAME, user)
+
     # 1. Search the graph
     search_results = await cognee.search(
-        query_type=SearchType.GRAPH_COMPLETION, query_text="Tell me about the artist AC/DC"
+        query_type=SearchType.GRAPH_COMPLETION,
+        query_text="Tell me about the artist AC/DC",
+        datasets=[TEST_DATASET_NAME],
     )
     print("Search results:", search_results)
 
@@ -197,6 +209,133 @@ async def relational_db_migration():
     print(f"All checks passed for {graph_db_provider} provider with '{relationship_label}' edges!")
 
 
+async def test_schema_only_migration():
+    # 1. Setup test DB and extract schema
+    migration_engine = await setup_test_db()
+    schema = await migration_engine.extract_schema()
+
+    # 2. Setup graph engine
+    graph_engine = await get_graph_engine()
+
+    # 4. Migrate schema only
+    await migrate_relational_database(graph_engine, schema=schema, schema_only=True)
+
+    # 5. Verify number of tables through search
+    search_results = await cognee.search(
+        query_text="How many tables are there in this database",
+        query_type=cognee.SearchType.GRAPH_COMPLETION,
+        top_k=30,
+    )
+    assert any("11" in r for r in search_results), (
+        "Number of tables in the database reported in search_results is either None or not equal to 11"
+    )
+
+    graph_db_provider = os.getenv("GRAPH_DATABASE_PROVIDER", "networkx").lower()
+
+    edge_counts = {
+        "is_part_of": 0,
+        "has_relationship": 0,
+        "foreign_key": 0,
+    }
+
+    if graph_db_provider == "neo4j":
+        for rel_type in edge_counts.keys():
+            query_str = f"""
+            MATCH ()-[r:{rel_type}]->()
+            RETURN count(r) as c
+            """
+            rows = await graph_engine.query(query_str)
+            edge_counts[rel_type] = rows[0]["c"]
+
+    elif graph_db_provider == "kuzu":
+        for rel_type in edge_counts.keys():
+            query_str = f"""
+            MATCH ()-[r:EDGE]->()
+            WHERE r.relationship_name = '{rel_type}'
+            RETURN count(r) as c
+            """
+            rows = await graph_engine.query(query_str)
+            edge_counts[rel_type] = rows[0][0]
+
+    elif graph_db_provider == "networkx":
+        nodes, edges = await graph_engine.get_graph_data()
+        for _, _, key, _ in edges:
+            if key in edge_counts:
+                edge_counts[key] += 1
+
+    else:
+        raise ValueError(f"Unsupported graph database provider: {graph_db_provider}")
+
+    # 7. Assert counts match expected values
+    expected_counts = {
+        "is_part_of": 11,
+        "has_relationship": 22,
+        "foreign_key": 11,
+    }
+
+    for rel_type, expected in expected_counts.items():
+        actual = edge_counts[rel_type]
+        assert actual == expected, (
+            f"Expected {expected} edges for relationship '{rel_type}', but found {actual}"
+        )
+
+    print("Schema-only migration edge counts validated successfully!")
+    print(f"Edge counts: {edge_counts}")
+
+
+async def test_search_result_quality():
+    from cognee.infrastructure.databases.relational import (
+        get_migration_relational_engine,
+    )
+
+    user = await get_default_user()
+    await create_authorized_dataset(TEST_DATASET_NAME, user)
+
+    # Get relational database with original data
+    migration_engine = get_migration_relational_engine()
+    from sqlalchemy import text
+
+    async with migration_engine.engine.connect() as conn:
+        result = await conn.execute(
+            text("""
+                SELECT
+                    c.CustomerId,
+                    c.FirstName,
+                    c.LastName,
+                    GROUP_CONCAT(i.InvoiceId, ',') AS invoice_ids
+                FROM Customer AS c
+                LEFT JOIN Invoice AS i ON c.CustomerId = i.CustomerId
+                GROUP BY c.CustomerId, c.FirstName, c.LastName
+            """)
+        )
+
+        for row in result:
+            # Get expected invoice IDs from relational DB for each Customer
+            customer_id = row.CustomerId
+            invoice_ids = row.invoice_ids.split(",") if row.invoice_ids else []
+            print(f"Relational DB Customer {customer_id}: {invoice_ids}")
+
+            # Use Cognee search to get invoice IDs for the same Customer but by providing Customer name
+            search_results = await cognee.search(
+                query_type=SearchType.GRAPH_COMPLETION,
+                query_text=f"List me all the invoices of Customer:{row.FirstName} {row.LastName}.",
+                top_k=50,
+                system_prompt="Just return me the invoiceID as a number without any text. This is an example output: ['1', '2', '3']. Where 1, 2, 3 are invoiceIDs of an invoice",
+                datasets=[TEST_DATASET_NAME],
+            )
+            print(f"Cognee search result: {search_results}")
+
+            import ast
+
+            lst = ast.literal_eval(search_results[0])  # converts string -> Python list
+            # Transfrom both lists to int for comparison, sorting and type consistency
+            lst = sorted([int(x) for x in lst])
+            invoice_ids = sorted([int(x) for x in invoice_ids])
+            assert lst == invoice_ids, (
+                f"Search results {lst} do not match expected invoice IDs {invoice_ids} for Customer:{customer_id}"
+            )
+
+
 async def test_migration_sqlite():
     database_to_migrate_path = os.path.join(pathlib.Path(__file__).parent, "test_data/")
 
@@ -209,6 +348,8 @@ async def test_migration_sqlite():
     )
 
     await relational_db_migration()
+    await test_search_result_quality()
+    await test_schema_only_migration()
 
 
 async def test_migration_postgres():
@@ -216,7 +357,7 @@ async def test_migration_postgres():
     cognee.config.set_migration_db_config(
         {
             "migration_db_name": "test_migration_db",
-            "migration_db_host": "127.0.0.1",
+            "migration_db_host": os.environ.get("DB_HOST", "127.0.0.1"),
             "migration_db_port": "5432",
             "migration_db_username": "cognee",
             "migration_db_password": "cognee",
@@ -224,6 +365,7 @@ async def test_migration_postgres():
         }
     )
     await relational_db_migration()
+    await test_schema_only_migration()
 
 
 async def main():

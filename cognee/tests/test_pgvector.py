@@ -1,6 +1,7 @@
 import os
 import pathlib
 import cognee
+from cognee.infrastructure.files.storage import get_storage_config
 from cognee.modules.search.operations import get_history
 from cognee.shared.logging_utils import get_logger
 from cognee.modules.data.models import Data
@@ -10,7 +11,7 @@ from cognee.modules.users.methods import get_default_user
 logger = get_logger()
 
 
-async def test_local_file_deletion(data_text, file_location):
+async def test_local_file_deletion(data_text, file_location, dataset_1_id, dataset_2_id):
     from sqlalchemy import select
     import hashlib
     from cognee.infrastructure.databases.relational import get_relational_engine
@@ -23,27 +24,29 @@ async def test_local_file_deletion(data_text, file_location):
         data_hash = hashlib.md5(encoded_text).hexdigest()
         # Get data entry from database based on hash contents
         data = (await session.scalars(select(Data).where(Data.content_hash == data_hash))).one()
-        assert os.path.isfile(data.raw_data_location), (
+        assert os.path.isfile(data.raw_data_location.replace("file://", "")), (
             f"Data location doesn't exist: {data.raw_data_location}"
         )
         # Test deletion of data along with local files created by cognee
-        await engine.delete_data_entity(data.id)
-        assert not os.path.exists(data.raw_data_location), (
+        await engine.delete_data_entity(data.id, dataset_id=dataset_2_id)
+        assert not os.path.exists(data.raw_data_location.replace("file://", "")), (
             f"Data location still exists after deletion: {data.raw_data_location}"
         )
 
     async with engine.get_async_session() as session:
         # Get data entry from database based on file path
         data = (
-            await session.scalars(select(Data).where(Data.raw_data_location == file_location))
+            await session.scalars(
+                select(Data).where(Data.original_data_location == "file://" + file_location)
+            )
         ).one()
-        assert os.path.isfile(data.raw_data_location), (
-            f"Data location doesn't exist: {data.raw_data_location}"
+        assert os.path.isfile(data.original_data_location.replace("file://", "")), (
+            f"Data location doesn't exist: {data.original_data_location}"
         )
         # Test local files not created by cognee won't get deleted
-        await engine.delete_data_entity(data.id)
-        assert os.path.exists(data.raw_data_location), (
-            f"Data location doesn't exists: {data.raw_data_location}"
+        await engine.delete_data_entity(data.id, dataset_id=dataset_1_id)
+        assert os.path.exists(data.original_data_location.replace("file://", "")), (
+            f"Data location doesn't exists: {data.original_data_location}"
         )
 
 
@@ -65,6 +68,162 @@ async def test_getting_of_documents(dataset_name_1):
     )
 
 
+async def test_vector_engine_search_none_limit():
+    query_text = "Tell me about Quantum computers"
+
+    from cognee.infrastructure.databases.vector import get_vector_engine
+
+    vector_engine = get_vector_engine()
+
+    collection_name = "Entity_name"
+
+    query_vector = (await vector_engine.embedding_engine.embed_text([query_text]))[0]
+
+    result = await vector_engine.search(
+        collection_name=collection_name, query_vector=query_vector, limit=None
+    )
+
+    # Check that we did not accidentally use any default value for limit
+    # in vector search along the way (like 5, 10, or 15)
+    assert len(result) > 15
+
+
+async def test_vector_engine_search_with_nodeset_filtering():
+    node_set_a = ["NLP"]
+    node_set_b = ["Quantum", "Computers"]
+    node_set_c = ["Quantum"]
+
+    explanation_file_path_nlp = os.path.join(
+        pathlib.Path(__file__).parent, "test_data/Natural_language_processing.txt"
+    )
+    await cognee.add([explanation_file_path_nlp], node_set=node_set_a)
+
+    explanation_file_path_quantum = os.path.join(
+        pathlib.Path(__file__).parent, "test_data/Quantum_computers.txt"
+    )
+
+    await cognee.add([explanation_file_path_quantum], node_set=node_set_b)
+
+    await cognee.add("Alice is an expert in Quantum Mechanics", node_set=node_set_c)
+
+    await cognee.cognify()
+
+    node_set = ["NLP", "Quantum"]
+    query_text = "Tell me about NLP"
+
+    from cognee.infrastructure.databases.vector import get_vector_engine
+
+    vector_engine = get_vector_engine()
+    query_vector = (await vector_engine.embedding_engine.embed_text([query_text]))[0]
+
+    # Search with "OR" operator
+    result = await vector_engine.search(
+        collection_name="DocumentChunk_text",
+        query_vector=query_vector,
+        include_payload=True,
+        limit=None,
+        node_name=node_set,
+        node_name_filter_operator="OR",
+    )
+
+    assert all(nodeset in node_set for nodeset in result[0].payload["belongs_to_set"]), (
+        "Only results from relevant nodesets should be returned"
+    )
+
+    # Search with "AND" operator
+    result = await vector_engine.search(
+        collection_name="DocumentChunk_text",
+        query_vector=query_vector,
+        include_payload=True,
+        limit=None,
+        node_name=node_set,
+        node_name_filter_operator="AND",
+    )
+
+    assert len(result) == 0, f"Results for search with all nodesets in {node_set} should be empty"
+
+    node_set = ["Quantum", "Computers"]
+
+    # Search with "OR" operator
+    result = await vector_engine.search(
+        collection_name="Entity_name",
+        query_vector=query_vector,
+        include_payload=True,
+        limit=None,
+        node_name=node_set,
+        node_name_filter_operator="OR",
+    )
+
+    assert any(entity.payload["text"].lower() == "alice" for entity in result), (
+        "Entity of Alice should be present in the results"
+    )
+
+    # Search with "AND" operator
+    result = await vector_engine.search(
+        collection_name="Entity_name",
+        query_vector=query_vector,
+        include_payload=True,
+        limit=None,
+        node_name=node_set,
+        node_name_filter_operator="AND",
+    )
+
+    assert all(entity.payload["text"].lower() != "alice" for entity in result), (
+        "Entity of Alice should NOT be present in the results"
+    )
+
+
+async def test_vector_nodeset_filtering_retriever_integration():
+    node_set = ["NLP", "Quantum"]
+    query_text = "Tell me about Quantum computers"
+
+    from cognee.modules.retrieval.graph_completion_retriever import GraphCompletionRetriever
+
+    # Search with "OR" operator
+    retriever = GraphCompletionRetriever(
+        node_name=node_set, node_name_filter_operator="OR", top_k=250
+    )
+    retrieved_objects = await retriever.get_retrieved_objects(query=query_text)
+    context = await retriever.get_context_from_objects(
+        query=query_text, retrieved_objects=retrieved_objects
+    )
+
+    assert "Quantum" in context
+    assert "NLP" in context
+
+    # Search with "AND" operator
+    retriever = GraphCompletionRetriever(node_name=node_set, node_name_filter_operator="AND")
+    retrieved_objects = await retriever.get_retrieved_objects(query=query_text)
+
+    assert len(retrieved_objects) == 0, (
+        f"Results for search with all nodesets in {node_set} should be empty"
+    )
+
+    node_set = ["Quantum", "Computers"]
+
+    # Search with "OR" operator
+    retriever = GraphCompletionRetriever(
+        node_name=node_set, node_name_filter_operator="OR", top_k=250
+    )
+    retrieved_objects = await retriever.get_retrieved_objects(query=query_text)
+    context = await retriever.get_context_from_objects(
+        query=query_text, retrieved_objects=retrieved_objects
+    )
+
+    assert "Alice" in context
+
+    # Search with "AND" operator
+    retriever = GraphCompletionRetriever(
+        node_name=node_set, node_name_filter_operator="AND", top_k=250
+    )
+    retrieved_objects = await retriever.get_retrieved_objects(query=query_text)
+    context = await retriever.get_context_from_objects(
+        query=query_text, retrieved_objects=retrieved_objects
+    )
+
+    assert "Alice" not in context
+
+
 async def main():
     cognee.config.set_vector_db_config(
         {"vector_db_url": "", "vector_db_key": "", "vector_db_provider": "pgvector"}
@@ -73,7 +232,7 @@ async def main():
         {
             "db_path": "",
             "db_name": "cognee_db",
-            "db_host": "127.0.0.1",
+            "db_host": os.environ.get("DB_HOST", "127.0.0.1"),
             "db_port": "5432",
             "db_username": "cognee",
             "db_password": "cognee",
@@ -94,16 +253,21 @@ async def main():
     )
     cognee.config.system_root_directory(cognee_directory_path)
 
+    node_set_a = ["NLP"]
+    node_set_b = ["Quantum", "Computers"]
+
     await cognee.prune.prune_data()
     await cognee.prune.prune_system(metadata=True)
 
     dataset_name_1 = "natural_language"
     dataset_name_2 = "quantum"
 
-    explanation_file_path = os.path.join(
+    explanation_file_path_nlp = os.path.join(
         pathlib.Path(__file__).parent, "test_data/Natural_language_processing.txt"
     )
-    await cognee.add([explanation_file_path], dataset_name_1)
+    add_1_payload = await cognee.add(
+        [explanation_file_path_nlp], dataset_name_1, node_set=node_set_a
+    )
 
     text = """A quantum computer is a computer that takes advantage of quantum mechanical phenomena.
     At small scales, physical matter exhibits properties of both particles and waves, and quantum computing leverages this behavior, specifically quantum superposition and entanglement, using specialized hardware that supports the preparation and manipulation of quantum states.
@@ -113,7 +277,7 @@ async def main():
     In principle, a non-quantum (classical) computer can solve the same computational problems as a quantum computer, given enough time. Quantum advantage comes in the form of time complexity rather than computability, and quantum complexity theory shows that some quantum algorithms for carefully selected tasks require exponentially fewer computational steps than the best known non-quantum algorithms. Such tasks can in theory be solved on a large-scale quantum computer whereas classical computers would not finish computations in any reasonable amount of time. However, quantum speedup is not universal or even typical across computational tasks, since basic tasks such as sorting are proven to not allow any asymptotic quantum speedup. Claims of quantum supremacy have drawn significant attention to the discipline, but are demonstrated on contrived tasks, while near-term practical use cases remain limited.
     """
 
-    await cognee.add([text], dataset_name_2)
+    add_2_payload = await cognee.add([text], dataset_name_2, node_set=node_set_b)
 
     await cognee.cognify([dataset_name_2, dataset_name_1])
 
@@ -122,11 +286,13 @@ async def main():
     await test_getting_of_documents(dataset_name_1)
 
     vector_engine = get_vector_engine()
-    random_node = (await vector_engine.search("Entity_name", "Quantum computer"))[0]
+    random_node = (
+        await vector_engine.search("Entity_name", "Quantum computer", include_payload=True)
+    )[0]
     random_node_name = random_node.payload["text"]
 
     search_results = await cognee.search(
-        query_type=SearchType.INSIGHTS, query_text=random_node_name
+        query_type=SearchType.GRAPH_COMPLETION, query_text=random_node_name
     )
     assert len(search_results) != 0, "The search results list is empty."
     print("\n\nExtracted sentences are:\n")
@@ -144,7 +310,6 @@ async def main():
     graph_completion = await cognee.search(
         query_type=SearchType.GRAPH_COMPLETION,
         query_text=random_node_name,
-        datasets=[dataset_name_2],
     )
     assert len(graph_completion) != 0, "Completion result is empty."
     print("Completion result is:")
@@ -162,10 +327,24 @@ async def main():
     history = await get_history(user.id)
     assert len(history) == 8, "Search history is not correct."
 
-    await test_local_file_deletion(text, explanation_file_path)
+    await test_vector_engine_search_none_limit()
+
+    await test_vector_engine_search_with_nodeset_filtering()
+    # Note: make sure to call test_vector_engine_search_with_nodeset_filtering()
+    # before test_vector_nodeset_filtering_retriever_integration() because another cognify happens in the first test,
+    # and the second one depends on it. Done like this to minimize number of cognify invocations.
+    await test_vector_nodeset_filtering_retriever_integration()
+
+    await test_local_file_deletion(
+        text,
+        explanation_file_path_nlp,
+        dataset_1_id=add_1_payload.dataset_id,
+        dataset_2_id=add_2_payload.dataset_id,
+    )
 
     await cognee.prune.prune_data()
-    assert not os.path.isdir(data_directory_path), "Local data files are not deleted"
+    data_root_directory = get_storage_config()["data_root_directory"]
+    assert not os.path.isdir(data_root_directory), "Local data files are not deleted"
 
     await cognee.prune.prune_system(metadata=True)
     tables_in_database = await vector_engine.get_table_names()

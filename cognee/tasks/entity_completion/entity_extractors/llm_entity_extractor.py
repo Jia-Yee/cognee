@@ -3,11 +3,11 @@ from typing import List
 
 from pydantic import BaseModel
 
+from cognee.infrastructure.llm.prompts import render_prompt, read_query_prompt
 from cognee.infrastructure.entities.BaseEntityExtractor import BaseEntityExtractor
 from cognee.modules.engine.models import Entity
 from cognee.modules.engine.models.EntityType import EntityType
-from cognee.infrastructure.llm.prompts import read_query_prompt, render_prompt
-from cognee.infrastructure.llm.get_llm_client import get_llm_client
+from cognee.infrastructure.llm.LLMGateway import LLMGateway
 
 logger = get_logger("llm_entity_extractor")
 
@@ -51,11 +51,10 @@ class LLMEntityExtractor(BaseEntityExtractor):
         try:
             logger.info(f"Extracting entities from text: {text[:100]}...")
 
-            llm_client = get_llm_client()
             user_prompt = render_prompt(self.user_prompt_template, {"text": text})
             system_prompt = read_query_prompt(self.system_prompt_template)
 
-            response = await llm_client.acreate_structured_output(
+            response = await LLMGateway.acreate_structured_output(
                 text_input=user_prompt,
                 system_prompt=system_prompt,
                 response_model=EntityList,

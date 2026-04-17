@@ -6,6 +6,9 @@ cognee/.data/
 
 code_pipeline_output*/
 
+# Test output files
+test_outputs/
+
 *.lance/
 .DS_Store
 # Byte-compiled / optimized / DLL files
@@ -36,6 +39,8 @@ share/python-wheels/
 *.egg-info/
 .installed.cfg
 *.egg
+.python-version
+cognee-mcp/.python-version
 MANIFEST
 
 # PyInstaller
@@ -145,6 +150,8 @@ venv/
 ENV/
 env.bak/
 venv.bak/
+mise.toml
+deployment/helm/values-local.yml
 
 # Spyder project settings
 .spyderproject
@@ -184,6 +191,7 @@ cognee/cache/
 # Default cognee system directory, used in development
 .cognee_system/
 .data_storage/
+.cognee_cache/
 .artifacts/
 .anon_id
 
@@ -194,3 +202,5 @@ SWE-bench_testsample/
 
 # ChromaDB Data
 .chromadb_data/
+
+deployment/helm/values-local.yml

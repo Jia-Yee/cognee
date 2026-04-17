@@ -1,13 +1,57 @@
-export default function handleServerErrors(response: Response): Promise<Response> {
+import { redirect } from "next/navigation";
+
+export default function handleServerErrors(
+  response: Response,
+  retry: ((response: Response) => Promise<Response>) | null = null,
+  useCloud: boolean = true,
+): Promise<Response> {
   return new Promise((resolve, reject) => {
-    if (response.status === 401) {
-      window.location.href = '/auth';
-      return;
+    // Local mode: redirect to local login on auth failures
+    if ((response.status === 401 || response.status === 403) && !useCloud) {
+      if (typeof window !== "undefined") {
+        window.location.href = "/local-login";
+      }
+      return reject(new Error("Session expired"));
+    }
+    if ((response.status === 401 || response.status === 403) && useCloud) {
+      if (response.status === 403) {
+        return response.clone().text().then((text) => {
+          if (text.toLowerCase().includes("verify your email")) {
+            return redirect("/verify-email");
+          }
+          if (retry) {
+            return retry(response).catch(() => redirect("/sign-in"));
+          }
+          return redirect("/sign-in");
+        });
+      }
+      if (retry) {
+        return retry(response)
+          .catch(() => {
+            return redirect("/sign-in");
+          });
+      } else {
+        return redirect("/sign-in");
+      }
     }
     if (!response.ok) {
-      return response.json().then(error => reject(error));
+      return response.text().then(text => {
+        let error: Record<string, unknown> = {};
+        try {
+          error = JSON.parse(text);
+        } catch {
+          error = { message: text || response.statusText };
+        }
+        error.status = response.status;
+        error.statusText = response.statusText;
+        reject(error);
+      });
     }
 
-    return resolve(response);
+    if (response.status >= 200 && response.status < 300) {
+      return resolve(response);
+    }
+
+    return reject(response);
   });
 }

@@ -1,6 +1,7 @@
 from typing import Any, Optional
+from fastapi.encoders import jsonable_encoder
+
 from cognee.infrastructure.databases.graph import get_graph_engine
-from cognee.infrastructure.databases.graph.networkx.adapter import NetworkXAdapter
 from cognee.modules.retrieval.base_retriever import BaseRetriever
 from cognee.modules.retrieval.utils.completion import generate_completion
 from cognee.modules.retrieval.exceptions import SearchTypeNotSupported, CypherSearchError
@@ -22,17 +23,48 @@ class CypherSearchRetriever(BaseRetriever):
         self,
         user_prompt_path: str = "context_for_question.txt",
         system_prompt_path: str = "answer_simple_question.txt",
+        session_id: Optional[str] = None,
     ):
         """Initialize retriever with optional custom prompt paths."""
         self.user_prompt_path = user_prompt_path
         self.system_prompt_path = system_prompt_path
+        self.session_id = session_id
 
-    async def get_context(self, query: str) -> Any:
+    async def get_retrieved_objects(self, query: str) -> Any:
+        try:
+            graph_engine = await get_graph_engine()
+
+            # Postgres backends do not support raw Cypher queries
+            from cognee.infrastructure.databases.graph.postgres.adapter import PostgresAdapter
+            from cognee.infrastructure.databases.hybrid.postgres.adapter import (
+                PostgresHybridAdapter,
+            )
+
+            if isinstance(graph_engine, (PostgresAdapter, PostgresHybridAdapter)):
+                raise SearchTypeNotSupported(
+                    "Cypher search is not supported with the Postgres graph backend. "
+                    "Use a graph-native backend (Neo4j, Kuzu) for raw Cypher queries."
+                )
+
+            is_empty = await graph_engine.is_empty()
+
+            if is_empty:
+                logger.warning("Search attempt on an empty knowledge graph")
+                return []
+
+            result = await graph_engine.query(query)
+        except SearchTypeNotSupported:
+            raise
+        except Exception as e:
+            logger.error("Failed to execute cypher search retrieval: %s", str(e))
+            raise CypherSearchError() from e
+        return result
+
+    async def get_context_from_objects(self, query: str, retrieved_objects: Any) -> Any:
         """
         Retrieves relevant context using a cypher query.
 
-        If the graph engine is an instance of NetworkXAdapter, raises SearchTypeNotSupported. If
-        any error occurs during execution, logs the error and raises CypherSearchError.
+        If any error occurs during execution, logs the error and raises CypherSearchError.
 
         Parameters:
         -----------
@@ -44,21 +76,13 @@ class CypherSearchRetriever(BaseRetriever):
 
             - Any: The result of the cypher query execution.
         """
-        try:
-            graph_engine = await get_graph_engine()
+        # TODO: Do we want to return a string response here?
+        # return jsonable_encoder(retrieved_objects)
+        return None
 
-            if isinstance(graph_engine, NetworkXAdapter):
-                raise SearchTypeNotSupported(
-                    "CYPHER search type not supported for NetworkXAdapter."
-                )
-
-            result = await graph_engine.query(query)
-        except Exception as e:
-            logger.error("Failed to execture cypher search retrieval: %s", str(e))
-            raise CypherSearchError() from e
-        return result
-
-    async def get_completion(self, query: str, context: Optional[Any] = None) -> Any:
+    async def get_completion_from_context(
+        self, query: str, retrieved_objects: Any, context: Optional[Any] = None
+    ) -> Any:
         """
         Returns the graph connections context.
 
@@ -70,12 +94,12 @@ class CypherSearchRetriever(BaseRetriever):
             - query (str): The query to retrieve context.
             - context (Optional[Any]): Optional context to use, otherwise fetched using the
               query. (default None)
+              defaults to 'default_session'. (default None)
 
         Returns:
         --------
 
             - Any: The context, either provided or retrieved.
         """
-        if context is None:
-            context = await self.get_context(query)
-        return context
+        # TODO: Do we want to generate a completion using LLM here?
+        return None

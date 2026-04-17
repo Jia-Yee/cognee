@@ -1,8 +1,9 @@
 import os
-from cognee.shared.logging_utils import get_logger
 import pathlib
-import cognee
 
+import cognee
+from cognee.shared.logging_utils import get_logger
+from cognee.infrastructure.files.storage import get_storage_config
 from cognee.modules.data.models import Data
 from cognee.modules.users.methods import get_default_user
 from cognee.modules.search.types import SearchType
@@ -24,12 +25,12 @@ async def test_local_file_deletion(data_text, file_location):
         data_hash = hashlib.md5(encoded_text).hexdigest()
         # Get data entry from database based on hash contents
         data = (await session.scalars(select(Data).where(Data.content_hash == data_hash))).one()
-        assert os.path.isfile(data.raw_data_location), (
+        assert os.path.isfile(data.raw_data_location.replace("file://", "")), (
             f"Data location doesn't exist: {data.raw_data_location}"
         )
         # Test deletion of data along with local files created by cognee
         await engine.delete_data_entity(data.id)
-        assert not os.path.exists(data.raw_data_location), (
+        assert not os.path.exists(data.raw_data_location.replace("file://", "")), (
             f"Data location still exists after deletion: {data.raw_data_location}"
         )
 
@@ -38,12 +39,12 @@ async def test_local_file_deletion(data_text, file_location):
         data = (
             await session.scalars(select(Data).where(Data.raw_data_location == file_location))
         ).one()
-        assert os.path.isfile(data.raw_data_location), (
+        assert os.path.isfile(data.raw_data_location.replace("file://", "")), (
             f"Data location doesn't exist: {data.raw_data_location}"
         )
         # Test local files not created by cognee won't get deleted
         await engine.delete_data_entity(data.id)
-        assert os.path.exists(data.raw_data_location), (
+        assert os.path.exists(data.raw_data_location.replace("file://", "")), (
             f"Data location doesn't exists: {data.raw_data_location}"
         )
 
@@ -64,6 +65,44 @@ async def test_getting_of_documents(dataset_name_1):
     assert len(document_ids) == 2, (
         f"Number of expected documents doesn't match {len(document_ids)} != 2"
     )
+
+
+async def test_vector_engine_search_none_limit():
+    file_path_quantum = os.path.join(
+        pathlib.Path(__file__).parent, "test_data/Quantum_computers.txt"
+    )
+
+    file_path_nlp = os.path.join(
+        pathlib.Path(__file__).parent,
+        "test_data/Natural_language_processing.txt",
+    )
+
+    await cognee.prune.prune_data()
+    await cognee.prune.prune_system(metadata=True)
+
+    await cognee.add(file_path_quantum)
+
+    await cognee.add(file_path_nlp)
+
+    await cognee.cognify()
+
+    query_text = "Tell me about Quantum computers"
+
+    from cognee.infrastructure.databases.vector import get_vector_engine
+
+    vector_engine = get_vector_engine()
+
+    collection_name = "Entity_name"
+
+    query_vector = (await vector_engine.embedding_engine.embed_text([query_text]))[0]
+
+    result = await vector_engine.search(
+        collection_name=collection_name, query_vector=query_vector, limit=None, include_payload=True
+    )
+
+    # Check that we did not accidentally use any default value for limit
+    # in vector search along the way (like 5, 10, or 15)
+    assert len(result) > 15
 
 
 async def main():
@@ -94,20 +133,16 @@ async def main():
     dataset_name_1 = "natural_language"
     dataset_name_2 = "quantum"
 
-    explanation_file_path = os.path.join(
+    explanation_file_path_nlp = os.path.join(
         pathlib.Path(__file__).parent, "test_data/Natural_language_processing.txt"
     )
-    await cognee.add([explanation_file_path], dataset_name_1)
+    await cognee.add([explanation_file_path_nlp], dataset_name_1)
 
-    text = """A quantum computer is a computer that takes advantage of quantum mechanical phenomena.
-    At small scales, physical matter exhibits properties of both particles and waves, and quantum computing leverages this behavior, specifically quantum superposition and entanglement, using specialized hardware that supports the preparation and manipulation of quantum states.
-    Classical physics cannot explain the operation of these quantum devices, and a scalable quantum computer could perform some calculations exponentially faster (with respect to input size scaling) than any modern "classical" computer. In particular, a large-scale quantum computer could break widely used encryption schemes and aid physicists in performing physical simulations; however, the current state of the technology is largely experimental and impractical, with several obstacles to useful applications. Moreover, scalable quantum computers do not hold promise for many practical tasks, and for many important tasks quantum speedups are proven impossible.
-    The basic unit of information in quantum computing is the qubit, similar to the bit in traditional digital electronics. Unlike a classical bit, a qubit can exist in a superposition of its two "basis" states. When measuring a qubit, the result is a probabilistic output of a classical bit, therefore making quantum computers nondeterministic in general. If a quantum computer manipulates the qubit in a particular way, wave interference effects can amplify the desired measurement results. The design of quantum algorithms involves creating procedures that allow a quantum computer to perform calculations efficiently and quickly.
-    Physically engineering high-quality qubits has proven challenging. If a physical qubit is not sufficiently isolated from its environment, it suffers from quantum decoherence, introducing noise into calculations. Paradoxically, perfectly isolating qubits is also undesirable because quantum computations typically need to initialize qubits, perform controlled qubit interactions, and measure the resulting quantum states. Each of those operations introduces errors and suffers from noise, and such inaccuracies accumulate.
-    In principle, a non-quantum (classical) computer can solve the same computational problems as a quantum computer, given enough time. Quantum advantage comes in the form of time complexity rather than computability, and quantum complexity theory shows that some quantum algorithms for carefully selected tasks require exponentially fewer computational steps than the best known non-quantum algorithms. Such tasks can in theory be solved on a large-scale quantum computer whereas classical computers would not finish computations in any reasonable amount of time. However, quantum speedup is not universal or even typical across computational tasks, since basic tasks such as sorting are proven to not allow any asymptotic quantum speedup. Claims of quantum supremacy have drawn significant attention to the discipline, but are demonstrated on contrived tasks, while near-term practical use cases remain limited.
-    """
+    explanation_file_path_quantum = os.path.join(
+        pathlib.Path(__file__).parent, "test_data/Quantum_computers.txt"
+    )
 
-    await cognee.add([text], dataset_name_2)
+    await cognee.add([explanation_file_path_quantum], dataset_name_2)
 
     await cognee.cognify([dataset_name_2, dataset_name_1])
 
@@ -120,7 +155,7 @@ async def main():
     random_node_name = random_node.payload["text"]
 
     search_results = await cognee.search(
-        query_type=SearchType.INSIGHTS, query_text=random_node_name
+        query_type=SearchType.GRAPH_COMPLETION, query_text=random_node_name
     )
     assert len(search_results) != 0, "The search results list is empty."
     print("\n\nExtracted sentences are:\n")
@@ -157,11 +192,14 @@ async def main():
     assert len(history) == 8, "Search history is not correct."
 
     await cognee.prune.prune_data()
-    assert not os.path.isdir(data_directory_path), "Local data files are not deleted"
+    data_root_directory = get_storage_config()["data_root_directory"]
+    assert not os.path.isdir(data_root_directory), "Local data files are not deleted"
 
     await cognee.prune.prune_system(metadata=True)
     tables_in_database = await vector_engine.get_collection_names()
     assert len(tables_in_database) == 0, "ChromaDB database is not empty"
+
+    await test_vector_engine_search_none_limit()
 
 
 if __name__ == "__main__":

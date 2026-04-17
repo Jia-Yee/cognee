@@ -8,4 +8,11 @@ from .exceptions import (
     EntityNotFoundError,
     EntityAlreadyExistsError,
     DatabaseNotCreatedError,
+    EmbeddingException,
+    MissingQueryParameterError,
+    MutuallyExclusiveQueryParametersError,
+    CacheConnectionError,
+    SessionQAEntryValidationError,
+    SessionParameterValidationError,
+    DatabaseCredentialsError,
 )

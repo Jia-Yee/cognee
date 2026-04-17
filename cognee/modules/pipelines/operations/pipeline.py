@@ -1,174 +1,108 @@
 import asyncio
-from typing import Union
-from uuid import NAMESPACE_OID, uuid5
+from uuid import UUID
+from typing import Optional, Union
+
+from cognee.modules.pipelines.layers.setup_and_check_environment import (
+    setup_and_check_environment,
+)
 
 from cognee.shared.logging_utils import get_logger
-from cognee.modules.data.methods import get_datasets
 from cognee.modules.data.methods.get_dataset_data import get_dataset_data
-from cognee.modules.data.methods.get_unique_dataset_id import get_unique_dataset_id
 from cognee.modules.data.models import Data, Dataset
 from cognee.modules.pipelines.operations.run_tasks import run_tasks
-from cognee.modules.pipelines.models import PipelineRunStatus
-from cognee.modules.pipelines.operations.get_pipeline_status import get_pipeline_status
+from cognee.modules.pipelines.layers import validate_pipeline_tasks
 from cognee.modules.pipelines.tasks.task import Task
-from cognee.modules.users.methods import get_default_user
 from cognee.modules.users.models import User
-from cognee.modules.pipelines.operations import log_pipeline_run_initiated
-
-from cognee.infrastructure.databases.relational import (
-    create_db_and_tables as create_relational_db_and_tables,
+from cognee.context_global_variables import set_database_global_context_variables
+from cognee.modules.pipelines.layers.resolve_authorized_user_datasets import (
+    resolve_authorized_user_datasets,
 )
-from cognee.infrastructure.databases.vector.pgvector import (
-    create_db_and_tables as create_pgvector_db_and_tables,
+from cognee.modules.pipelines.layers.check_pipeline_run_qualification import (
+    check_pipeline_run_qualification,
 )
+from cognee.modules.pipelines.models.PipelineRunInfo import (
+    PipelineRunStarted,
+)
+from typing import Any
 
 logger = get_logger("cognee.pipeline")
 
 update_status_lock = asyncio.Lock()
 
 
-async def cognee_pipeline(
+async def run_pipeline(
     tasks: list[Task],
     data=None,
-    datasets: Union[str, list[str]] = None,
-    user: User = None,
+    datasets: Optional[Union[str, list[str], list[UUID]]] = None,
+    user: Optional[User] = None,
     pipeline_name: str = "custom_pipeline",
+    use_pipeline_cache: bool = False,
+    vector_db_config: Optional[dict] = None,
+    graph_db_config: Optional[dict] = None,
+    incremental_loading: bool = False,
+    data_per_batch: int = 20,
 ):
-    # Create tables for databases
-    await create_relational_db_and_tables()
-    await create_pgvector_db_and_tables()
+    validate_pipeline_tasks(tasks)
+    await setup_and_check_environment(vector_db_config, graph_db_config)
 
-    # Initialize first_run attribute if it doesn't exist
-    if not hasattr(cognee_pipeline, "first_run"):
-        cognee_pipeline.first_run = True
+    user, authorized_datasets = await resolve_authorized_user_datasets(datasets, user)
 
-    if cognee_pipeline.first_run:
-        from cognee.infrastructure.llm.utils import test_llm_connection, test_embedding_connection
-
-        # Test LLM and Embedding configuration once before running Cognee
-        await test_llm_connection()
-        await test_embedding_connection()
-        cognee_pipeline.first_run = False  # Update flag after first run
-
-    # If no user is provided use default user
-    if user is None:
-        user = await get_default_user()
-
-    # Convert datasets to list in case it's a string
-    if isinstance(datasets, str):
-        datasets = [datasets]
-
-    # If no datasets are provided, work with all existing datasets.
-    existing_datasets = await get_datasets(user.id)
-
-    if not datasets:
-        # Get datasets from database if none sent.
-        datasets = existing_datasets
-    else:
-        # If dataset is already in database, use it, otherwise create a new instance.
-        dataset_instances = []
-
-        for dataset_name in datasets:
-            is_dataset_found = False
-
-            for existing_dataset in existing_datasets:
-                if (
-                    existing_dataset.name == dataset_name
-                    or str(existing_dataset.id) == dataset_name
-                ):
-                    dataset_instances.append(existing_dataset)
-                    is_dataset_found = True
-                    break
-
-            if not is_dataset_found:
-                dataset_instances.append(
-                    Dataset(
-                        id=await get_unique_dataset_id(dataset_name=dataset_name, user=user),
-                        name=dataset_name,
-                        owner_id=user.id,
-                    )
-                )
-
-        datasets = dataset_instances
-
-    awaitables = []
-
-    for dataset in datasets:
-        awaitables.append(
-            run_pipeline(
-                dataset=dataset, user=user, tasks=tasks, data=data, pipeline_name=pipeline_name
-            )
-        )
-
-    return await asyncio.gather(*awaitables)
+    for dataset in authorized_datasets:
+        async for run_info in run_pipeline_per_dataset(
+            dataset=dataset,
+            user=user,
+            tasks=tasks,
+            data=data,
+            pipeline_name=pipeline_name,
+            use_pipeline_cache=use_pipeline_cache,
+            incremental_loading=incremental_loading,
+            data_per_batch=data_per_batch,
+        ):
+            yield run_info
 
 
-async def run_pipeline(
+async def run_pipeline_per_dataset(
     dataset: Dataset,
     user: User,
     tasks: list[Task],
-    data=None,
+    data: Optional[list[Data]] = None,
     pipeline_name: str = "custom_pipeline",
+    use_pipeline_cache=False,
+    incremental_loading=False,
+    data_per_batch: int = 20,
 ):
-    check_dataset_name(dataset.name)
-
-    # Ugly hack, but no easier way to do this.
-    if pipeline_name == "add_pipeline":
-        # Refresh the add pipeline status so data is added to a dataset.
-        # Without this the app_pipeline status will be DATASET_PROCESSING_COMPLETED and will skip the execution.
-        dataset_id = uuid5(NAMESPACE_OID, f"{dataset.name}{str(user.id)}")
-
-        await log_pipeline_run_initiated(
-            pipeline_id=uuid5(NAMESPACE_OID, "add_pipeline"),
-            pipeline_name="add_pipeline",
-            dataset_id=dataset_id,
-        )
-
-        # Refresh the cognify pipeline status after we add new files.
-        # Without this the cognify_pipeline status will be DATASET_PROCESSING_COMPLETED and will skip the execution.
-        await log_pipeline_run_initiated(
-            pipeline_id=uuid5(NAMESPACE_OID, "cognify_pipeline"),
-            pipeline_name="cognify_pipeline",
-            dataset_id=dataset_id,
-        )
-
-    dataset_id = dataset.id
+    # Will only be used if ENABLE_BACKEND_ACCESS_CONTROL is set to True
+    await set_database_global_context_variables(dataset.id, dataset.owner_id)
 
     if not data:
-        data: list[Data] = await get_dataset_data(dataset_id=dataset_id)
+        data = await get_dataset_data(dataset_id=dataset.id)
 
-    # async with update_status_lock: TODO: Add UI lock to prevent multiple backend requests
-    if isinstance(dataset, Dataset):
-        task_status = await get_pipeline_status([dataset_id], pipeline_name)
-    else:
-        task_status = [
-            PipelineRunStatus.DATASET_PROCESSING_COMPLETED
-        ]  # TODO: this is a random assignment, find permanent solution
-
-    if str(dataset_id) in task_status:
-        if task_status[str(dataset_id)] == PipelineRunStatus.DATASET_PROCESSING_STARTED:
-            logger.info("Dataset %s is already being processed.", dataset_id)
+    process_pipeline_status = await check_pipeline_run_qualification(dataset, data, pipeline_name)
+    if process_pipeline_status:
+        # If pipeline was already processed or is currently being processed
+        # return status information to async generator and finish execution
+        if use_pipeline_cache:
+            # If pipeline caching is enabled we do not proceed with re-processing
+            yield process_pipeline_status
             return
-        if task_status[str(dataset_id)] == PipelineRunStatus.DATASET_PROCESSING_COMPLETED:
-            logger.info("Dataset %s is already processed.", dataset_id)
-            return
+        else:
+            # If pipeline caching is disabled we always return pipeline started information and proceed with re-processing
+            yield PipelineRunStarted(
+                pipeline_run_id=process_pipeline_status.pipeline_run_id,
+                dataset_id=dataset.id,
+                dataset_name=dataset.name,
+                payload=data,
+            )
 
-    if not isinstance(tasks, list):
-        raise ValueError("Tasks must be a list")
+    pipeline_run = run_tasks(
+        tasks,
+        dataset.id,
+        data,
+        user,
+        pipeline_name,
+        incremental_loading=incremental_loading,
+        data_per_batch=data_per_batch,
+    )
 
-    for task in tasks:
-        if not isinstance(task, Task):
-            raise ValueError(f"Task {task} is not an instance of Task")
-
-    pipeline_run = run_tasks(tasks, dataset_id, data, user, pipeline_name)
-    pipeline_run_status = None
-
-    async for run_status in pipeline_run:
-        pipeline_run_status = run_status
-
-    return pipeline_run_status
-
-
-def check_dataset_name(dataset_name: str) -> str:
-    if "." in dataset_name or " " in dataset_name:
-        raise ValueError("Dataset name cannot contain spaces or underscores")
+    async for pipeline_run_info in pipeline_run:
+        yield pipeline_run_info

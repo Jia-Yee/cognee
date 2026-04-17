@@ -1,12 +1,14 @@
-from fastapi import Form, UploadFile, Depends
+from uuid import UUID
+from deprecated import deprecated
+from fastapi import Depends
 from fastapi.responses import JSONResponse
 from fastapi import APIRouter
-from typing import List, Optional
-import subprocess
+
 from cognee.shared.logging_utils import get_logger
-import requests
 from cognee.modules.users.models import User
 from cognee.modules.users.methods import get_authenticated_user
+from cognee.shared.utils import send_telemetry
+from cognee import __version__ as cognee_version
 
 logger = get_logger()
 
@@ -14,64 +16,56 @@ logger = get_logger()
 def get_delete_router() -> APIRouter:
     router = APIRouter()
 
-    @router.delete("/", response_model=None)
+    @router.delete("", response_model=None, deprecated=True)
+    @deprecated(
+        reason="DELETE /v1/delete is deprecated. Use DELETE /v1/datasets/{dataset_id}/data/{data_id} instead.",
+        version="0.3.9",
+    )
     async def delete(
-        data: List[UploadFile],
-        dataset_name: str = Form("main_dataset"),
-        mode: str = Form("soft"),
+        data_id: UUID,
+        dataset_id: UUID,
+        mode: str = "soft",
         user: User = Depends(get_authenticated_user),
+        delete_dataset_if_empty: bool = False,
     ):
-        """This endpoint is responsible for deleting data from the graph.
+        """Delete data by its ID from the specified dataset.
 
         Args:
-            data: The data to delete (files, URLs, or text)
-            dataset_name: Name of the dataset to delete from (default: "main_dataset")
+            data_id: The UUID of the data to delete
+            dataset_id: The UUID of the dataset containing the data
             mode: "soft" (default) or "hard" - hard mode also deletes degree-one entity nodes
             user: Authenticated user
+            delete_dataset_if_empty: If True, deletes the dataset if it is left empty after data deletion
+
+        Returns:
+            JSON response indicating success or failure
+
         """
-        from cognee.api.v1.delete import delete as cognee_delete
+        send_telemetry(
+            "Delete API Endpoint Invoked",
+            user.id,
+            additional_properties={
+                "endpoint": "DELETE /v1/delete",
+                "dataset_id": str(dataset_id),
+                "data_id": str(data_id),
+                "cognee_version": cognee_version,
+            },
+        )
+
+        from cognee.api.v1.datasets import datasets
 
         try:
-            # Handle each file in the list
-            results = []
-            for file in data:
-                if file.filename.startswith("http"):
-                    if "github" in file.filename:
-                        # For GitHub repos, we need to get the content hash of each file
-                        repo_name = file.filename.split("/")[-1].replace(".git", "")
-                        subprocess.run(
-                            ["git", "clone", file.filename, f".data/{repo_name}"], check=True
-                        )
-                        # Note: This would need to be implemented to get content hashes of all files
-                        # For now, we'll just return an error
-                        return JSONResponse(
-                            status_code=400,
-                            content={"error": "Deleting GitHub repositories is not yet supported"},
-                        )
-                    else:
-                        # Fetch and delete the data from other types of URL
-                        response = requests.get(file.filename)
-                        response.raise_for_status()
-                        file_data = response.content
-                        result = await cognee_delete(
-                            file_data, dataset_name=dataset_name, mode=mode
-                        )
-                        results.append(result)
-                else:
-                    # Handle uploaded file by accessing its file attribute
-                    result = await cognee_delete(file.file, dataset_name=dataset_name, mode=mode)
-                    results.append(result)
+            result = await datasets.delete_data(
+                dataset_id=dataset_id,
+                data_id=data_id,
+                user=user,
+                mode=mode,
+                delete_dataset_if_empty=delete_dataset_if_empty,
+            )
+            return result
 
-            if len(results) == 1:
-                return results[0]
-            else:
-                return {
-                    "status": "success",
-                    "message": "Multiple documents deleted",
-                    "results": results,
-                }
         except Exception as error:
-            logger.error(f"Error during deletion: {str(error)}")
+            logger.error(f"Error during deletion by data_id: {str(error)}")
             return JSONResponse(status_code=409, content={"error": str(error)})
 
     return router

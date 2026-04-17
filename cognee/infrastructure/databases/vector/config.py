@@ -1,7 +1,11 @@
 import os
+import pydantic
+from pathlib import Path
 from functools import lru_cache
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from cognee.root_dir import get_absolute_path
+
+from cognee.base_config import get_base_config
+from cognee.root_dir import ensure_absolute_path
 
 
 class VectorConfig(BaseSettings):
@@ -9,25 +13,44 @@ class VectorConfig(BaseSettings):
     Manage the configuration settings for the vector database.
 
     Public methods:
-
     - to_dict: Convert the configuration to a dictionary.
 
     Instance variables:
-
     - vector_db_url: The URL of the vector database.
     - vector_db_port: The port for the vector database.
+    - vector_db_name: The name of the vector database.
     - vector_db_key: The key for accessing the vector database.
     - vector_db_provider: The provider for the vector database.
     """
 
-    vector_db_url: str = os.path.join(
-        os.path.join(get_absolute_path(".cognee_system"), "databases"), "cognee.lancedb"
-    )
+    vector_db_url: str = ""
     vector_db_port: int = 1234
+    vector_db_name: str = ""
     vector_db_key: str = ""
     vector_db_provider: str = "lancedb"
+    vector_dataset_database_handler: str = "lancedb"
+    vector_db_username: str = ""
+    vector_db_password: str = ""
+    vector_db_host: str = ""
 
     model_config = SettingsConfigDict(env_file=".env", extra="allow")
+
+    @pydantic.model_validator(mode="after")
+    def validate_paths(self):
+        base_config = get_base_config()
+
+        # If vector_db_url is provided and is not a path skip checking if path is absolute (as it can also be a url)
+        if self.vector_db_url and Path(self.vector_db_url).exists():
+            # Relative path to absolute
+            self.vector_db_url = ensure_absolute_path(
+                self.vector_db_url,
+            )
+        elif not self.vector_db_url:
+            # Default path
+            databases_directory_path = os.path.join(base_config.system_root_directory, "databases")
+            self.vector_db_url = os.path.join(databases_directory_path, "cognee.lancedb")
+
+        return self
 
     def to_dict(self) -> dict:
         """
@@ -41,8 +64,13 @@ class VectorConfig(BaseSettings):
         return {
             "vector_db_url": self.vector_db_url,
             "vector_db_port": self.vector_db_port,
+            "vector_db_name": self.vector_db_name,
             "vector_db_key": self.vector_db_key,
             "vector_db_provider": self.vector_db_provider,
+            "vector_dataset_database_handler": self.vector_dataset_database_handler,
+            "vector_db_username": self.vector_db_username,
+            "vector_db_password": self.vector_db_password,
+            "vector_db_host": self.vector_db_host,
         }
 
 
@@ -62,3 +90,12 @@ def get_vectordb_config():
           configuration.
     """
     return VectorConfig()
+
+
+def get_vectordb_context_config():
+    """This function will get the appropriate vector db config based on async context."""
+    from cognee.context_global_variables import vector_db_config
+
+    if vector_db_config.get():
+        return vector_db_config.get()
+    return get_vectordb_config().to_dict()

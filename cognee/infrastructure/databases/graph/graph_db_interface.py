@@ -1,13 +1,8 @@
-import inspect
-from functools import wraps
+from uuid import UUID
 from abc import abstractmethod, ABC
-from datetime import datetime, timezone
-from typing import Optional, Dict, Any, List, Tuple, Type
-from uuid import NAMESPACE_OID, UUID, uuid5
+from typing import Optional, Dict, Any, List, Tuple, Type, Union
 from cognee.shared.logging_utils import get_logger
 from cognee.infrastructure.engine import DataPoint
-from cognee.modules.data.models.graph_relationship_ledger import GraphRelationshipLedger
-from cognee.infrastructure.databases.relational.get_relational_engine import get_relational_engine
 
 logger = get_logger()
 
@@ -17,111 +12,6 @@ EdgeData = Tuple[
     str, str, str, Dict[str, Any]
 ]  # (source_id, target_id, relationship_name, properties)
 Node = Tuple[str, NodeData]  # (node_id, properties)
-
-
-def record_graph_changes(func):
-    """
-    Decorator to record graph changes in the relationship database.
-
-    Parameters:
-    -----------
-
-        - func: The asynchronous function to wrap, which likely modifies graph data.
-
-    Returns:
-    --------
-
-        Returns the wrapped function that manages database relationships.
-    """
-
-    @wraps(func)
-    async def wrapper(self, *args, **kwargs):
-        """
-        Wraps the given asynchronous function to handle database relationships.
-
-        Tracks the caller's function and class name for context. When the wrapped function is
-        called, it manages database relationships for nodes or edges by adding entries to a
-        ledger and committing the changes to the database session. Errors during relationship
-        addition or session commit are logged and will not disrupt the execution of the wrapped
-        function.
-
-        Parameters:
-        -----------
-
-            - *args: Positional arguments passed to the wrapped function.
-            - **kwargs: Keyword arguments passed to the wrapped function.
-
-        Returns:
-        --------
-
-            Returns the result of the wrapped function call.
-        """
-        db_engine = get_relational_engine()
-        frame = inspect.currentframe()
-        while frame:
-            if frame.f_back and frame.f_back.f_code.co_name != "wrapper":
-                caller_frame = frame.f_back
-                break
-            frame = frame.f_back
-
-        caller_name = caller_frame.f_code.co_name
-        caller_class = (
-            caller_frame.f_locals.get("self", None).__class__.__name__
-            if caller_frame.f_locals.get("self", None)
-            else None
-        )
-        creator = f"{caller_class}.{caller_name}" if caller_class else caller_name
-
-        result = await func(self, *args, **kwargs)
-
-        async with db_engine.get_async_session() as session:
-            if func.__name__ == "add_nodes":
-                nodes: List[DataPoint] = args[0]
-                for node in nodes:
-                    try:
-                        node_id = UUID(str(node.id))
-                        relationship = GraphRelationshipLedger(
-                            id=uuid5(NAMESPACE_OID, f"{datetime.now(timezone.utc).timestamp()}"),
-                            source_node_id=node_id,
-                            destination_node_id=node_id,
-                            creator_function=f"{creator}.node",
-                            node_label=getattr(node, "name", None) or str(node.id),
-                        )
-                        session.add(relationship)
-                        await session.flush()
-                    except Exception as e:
-                        logger.debug(f"Error adding relationship: {e}")
-                        await session.rollback()
-                        continue
-
-            elif func.__name__ == "add_edges":
-                edges = args[0]
-                for edge in edges:
-                    try:
-                        source_id = UUID(str(edge[0]))
-                        target_id = UUID(str(edge[1]))
-                        rel_type = str(edge[2])
-                        relationship = GraphRelationshipLedger(
-                            id=uuid5(NAMESPACE_OID, f"{datetime.now(timezone.utc).timestamp()}"),
-                            source_node_id=source_id,
-                            destination_node_id=target_id,
-                            creator_function=f"{creator}.{rel_type}",
-                        )
-                        session.add(relationship)
-                        await session.flush()
-                    except Exception as e:
-                        logger.debug(f"Error adding relationship: {e}")
-                        await session.rollback()
-                        continue
-
-            try:
-                await session.commit()
-            except Exception as e:
-                logger.debug(f"Error committing session: {e}")
-
-        return result
-
-    return wrapper
 
 
 class GraphDBInterface(ABC):
@@ -150,6 +40,11 @@ class GraphDBInterface(ABC):
     """
 
     @abstractmethod
+    async def is_empty(self) -> bool:
+        logger.warning("is_empty() is not implemented")
+        return True
+
+    @abstractmethod
     async def query(self, query: str, params: dict) -> List[Any]:
         """
         Execute a raw database query and return the results.
@@ -163,28 +58,30 @@ class GraphDBInterface(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    async def add_node(self, node_id: str, properties: Dict[str, Any]) -> None:
+    async def add_node(
+        self, node: Union[DataPoint, str], properties: Optional[Dict[str, Any]] = None
+    ) -> None:
         """
         Add a single node with specified properties to the graph.
 
         Parameters:
         -----------
 
-            - node_id (str): Unique identifier for the node being added.
-            - properties (Dict[str, Any]): A dictionary of properties associated with the node.
+            - node (Union[DataPoint, str]): Either a DataPoint object or a string identifier for the node being added.
+            - properties (Optional[Dict[str, Any]]): A dictionary of properties associated with the node.
+              Required when node is a string, ignored when node is a DataPoint.
         """
         raise NotImplementedError
 
     @abstractmethod
-    @record_graph_changes
-    async def add_nodes(self, nodes: List[Node]) -> None:
+    async def add_nodes(self, nodes: Union[List[Node], List[DataPoint]]) -> None:
         """
         Add multiple nodes to the graph in a single operation.
 
         Parameters:
         -----------
 
-            - nodes (List[Node]): A list of Node objects to be added to the graph.
+            - nodes (Union[List[Node], List[DataPoint]]): A list of Node objects or DataPoint objects to be added to the graph.
         """
         raise NotImplementedError
 
@@ -260,15 +157,16 @@ class GraphDBInterface(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    @record_graph_changes
-    async def add_edges(self, edges: List[EdgeData]) -> None:
+    async def add_edges(
+        self, edges: Union[List[EdgeData], List[Tuple[str, str, str, Optional[Dict[str, Any]]]]]
+    ) -> None:
         """
         Add multiple edges to the graph in a single operation.
 
         Parameters:
         -----------
 
-            - edges (List[EdgeData]): A list of EdgeData objects representing edges to be added.
+            - edges (Union[List[EdgeData], List[Tuple[str, str, str, Optional[Dict[str, Any]]]]]): A list of EdgeData objects or tuples representing edges to be added.
         """
         raise NotImplementedError
 
@@ -352,7 +250,7 @@ class GraphDBInterface(ABC):
 
     @abstractmethod
     async def get_nodeset_subgraph(
-        self, node_type: Type[Any], node_name: List[str]
+        self, node_type: Type[Any], node_name: List[str], node_name_filter_operator: str = "OR"
     ) -> Tuple[List[Tuple[int, dict]], List[Tuple[int, int, str, dict]]]:
         """
         Fetch a subgraph consisting of a specific set of nodes and their relationships.
@@ -367,7 +265,7 @@ class GraphDBInterface(ABC):
 
     @abstractmethod
     async def get_connections(
-        self, node_id: str
+        self, node_id: Union[str, UUID]
     ) -> List[Tuple[NodeData, Dict[str, Any], NodeData]]:
         """
         Get all nodes connected to a specified node and their relationship details.
@@ -375,6 +273,91 @@ class GraphDBInterface(ABC):
         Parameters:
         -----------
 
-            - node_id (str): Unique identifier of the node for which to retrieve connections.
+            - node_id (Union[str, UUID]): Unique identifier of the node for which to retrieve connections.
         """
         raise NotImplementedError
+
+    @abstractmethod
+    async def get_neighborhood(
+        self,
+        node_ids: List[str],
+        depth: int = 1,
+        edge_types: Optional[List[str]] = None,
+    ) -> Tuple[List[Node], List[EdgeData]]:
+        """
+        Get the k-hop neighborhood subgraph around a set of seed nodes.
+
+        Returns all nodes and edges within `depth` hops of any seed node,
+        in the same format as get_graph_data().
+        Optional edge_type filtering to constrain traversal paths.
+
+        Parameters:
+        -----------
+
+            - node_ids (List[str]): Seed node identifiers to start traversal from.
+            - depth (int): Number of hops to traverse from each seed node. (default 1)
+            - edge_types (Optional[List[str]]): If provided, only traverse edges of these
+              relationship types. (default None)
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    async def get_filtered_graph_data(
+        self, attribute_filters: List[Dict[str, List[Union[str, int]]]]
+    ) -> Tuple[List[Node], List[EdgeData]]:
+        """
+        Retrieve nodes and edges filtered by the provided attribute criteria.
+
+        Parameters:
+        -----------
+
+            - attribute_filters: A list of dictionaries where keys are attribute names and values
+              are lists of attribute values to filter by.
+        """
+        raise NotImplementedError
+
+    async def get_node_feedback_weights(self, node_ids: List[str]) -> Dict[str, float]:
+        """
+        Retrieve node feedback weights for multiple node ids.
+        Returns only found node ids.
+        """
+        raise NotImplementedError("get_node_feedback_weights is not implemented for this adapter")
+
+    async def set_node_feedback_weights(
+        self, node_feedback_weights: Dict[str, float]
+    ) -> Dict[str, bool]:
+        """
+        Persist node feedback weights for multiple node ids.
+        Returns per-id update success.
+        """
+        raise NotImplementedError("set_node_feedback_weights is not implemented for this adapter")
+
+    async def get_edge_feedback_weights(self, edge_object_ids: List[str]) -> Dict[str, float]:
+        """
+        Retrieve edge feedback weights for multiple edge_object_ids.
+        Returns only found edge ids.
+        """
+        raise NotImplementedError("get_edge_feedback_weights is not implemented for this adapter")
+
+    async def set_edge_feedback_weights(
+        self, edge_feedback_weights: Dict[str, float]
+    ) -> Dict[str, bool]:
+        """
+        Persist edge feedback weights for multiple edge_object_ids.
+        Returns per-id update success.
+        """
+        raise NotImplementedError("set_edge_feedback_weights is not implemented for this adapter")
+
+    async def get_triplets_batch(self, offset: int, limit: int) -> List[Dict[str, Any]]:
+        """Retrieve a batch of triplets (source, edge, target).
+
+        Optional extension — implemented by PostgresAdapter, Neo4jAdapter,
+        and KuzuAdapter but not NeptuneGraphDB.
+
+        Parameters:
+        -----------
+
+            - offset: Number of triplets to skip.
+            - limit: Maximum number of triplets to return.
+        """
+        raise NotImplementedError("get_triplets_batch is not implemented for this adapter")

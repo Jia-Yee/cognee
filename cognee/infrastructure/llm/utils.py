@@ -1,10 +1,16 @@
-from cognee.shared.logging_utils import get_logger
+import asyncio
+
 import litellm
 
-from cognee.infrastructure.databases.vector import get_vector_engine
-from cognee.infrastructure.llm.get_llm_client import get_llm_client
+from cognee.infrastructure.llm.structured_output_framework.litellm_instructor.llm.get_llm_client import (
+    get_llm_client,
+)
+from cognee.shared.logging_utils import get_logger
+from cognee.infrastructure.llm.LLMGateway import LLMGateway
 
 logger = get_logger()
+
+CONNECTION_TEST_TIMEOUT_SECONDS = 30
 
 
 def get_max_chunk_tokens():
@@ -22,19 +28,22 @@ def get_max_chunk_tokens():
           the smaller value of the embedding engine's max tokens and half of the LLM's
           maximum tokens.
     """
+    # NOTE: Import must be done in function to avoid circular import issue
+    from cognee.infrastructure.databases.vector import get_vector_engine
+
     # Calculate max chunk size based on the following formula
     embedding_engine = get_vector_engine().embedding_engine
-    llm_client = get_llm_client()
+    llm_client = get_llm_client(raise_api_key_error=False)
 
     # We need to make sure chunk size won't take more than half of LLM max context token size
     # but it also can't be bigger than the embedding engine max token size
-    llm_cutoff_point = llm_client.max_tokens // 2  # Round down the division
-    max_chunk_tokens = min(embedding_engine.max_tokens, llm_cutoff_point)
+    llm_cutoff_point = llm_client.max_completion_tokens // 2  # Round down the division
+    max_chunk_tokens = min(embedding_engine.max_completion_tokens, llm_cutoff_point)
 
     return max_chunk_tokens
 
 
-def get_model_max_tokens(model_name: str):
+def get_model_max_completion_tokens(model_name: str):
     """
     Retrieve the maximum token limit for a specified model name if it exists.
 
@@ -52,33 +61,51 @@ def get_model_max_tokens(model_name: str):
 
         Number of max tokens of model, or None if model is unknown
     """
-    max_tokens = None
+    max_completion_tokens = None
 
     if model_name in litellm.model_cost:
-        max_tokens = litellm.model_cost[model_name]["max_tokens"]
-        logger.debug(f"Max input tokens for {model_name}: {max_tokens}")
+        if "max_tokens" in litellm.model_cost[model_name]:
+            max_completion_tokens = litellm.model_cost[model_name]["max_tokens"]
+            logger.debug(f"Max input tokens for {model_name}: {max_completion_tokens}")
+        else:
+            logger.debug(
+                f"Model max_tokens not found in LiteLLM's model_cost for model {model_name}."
+            )
     else:
-        logger.info("Model not found in LiteLLM's model_cost.")
+        logger.debug("Model not found in LiteLLM's model_cost.")
 
-    return max_tokens
+    return max_completion_tokens
 
 
 async def test_llm_connection():
     """
-    Establish a connection to the LLM and create a structured output.
-
-    Attempt to connect to the LLM client and uses the adapter to create a structured output
-    with a predefined text input and system prompt. Log any exceptions encountered during
-    the connection attempt and re-raise the exception for further handling.
+    Test connectivity to the LLM endpoint using a simple completion call.
     """
     try:
-        llm_adapter = get_llm_client()
-        await llm_adapter.acreate_structured_output(
-            text_input="test",
-            system_prompt='Respond to me with the following string: "test"',
-            response_model=str,
+        logger.info("Testing connection to LLM endpoint...")
+        await asyncio.wait_for(
+            LLMGateway.acreate_structured_output(
+                text_input="test",
+                system_prompt='Respond to me with the following string: "test"',
+                response_model=str,
+            ),
+            timeout=CONNECTION_TEST_TIMEOUT_SECONDS,
         )
-
+    except asyncio.TimeoutError:
+        msg = (
+            f"LLM connection test timed out after {CONNECTION_TEST_TIMEOUT_SECONDS}s. "
+            "Check that your LLM endpoint is reachable and responding. "
+            "Set COGNEE_SKIP_CONNECTION_TEST=true to bypass this check."
+        )
+        logger.error(msg)
+        raise TimeoutError(msg)
+    except litellm.exceptions.AuthenticationError as e:
+        msg = (
+            "LLM authentication failed. Check your LLM_API_KEY configuration. "
+            "Set COGNEE_SKIP_CONNECTION_TEST=true to bypass this check."
+        )
+        logger.error(msg)
+        raise e
     except Exception as e:
         logger.error(e)
         logger.error("Connection to LLM could not be established.")
@@ -91,9 +118,25 @@ async def test_embedding_connection():
 
     Handles exceptions that may occur during the operation, logs the error, and re-raises
     the exception if the connection to the embedding handler cannot be established.
+    Wrapped in a timeout to prevent indefinite hangs.
     """
     try:
-        await get_vector_engine().embedding_engine.embed_text("test")
+        # NOTE: Vector engine import must be done in function to avoid circular import issue
+        from cognee.infrastructure.databases.vector import get_vector_engine
+
+        logger.info("Testing connection to Embedding endpoint...")
+        await asyncio.wait_for(
+            get_vector_engine().embedding_engine.embed_text("test"),
+            timeout=CONNECTION_TEST_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        msg = (
+            f"Embedding connection test timed out after {CONNECTION_TEST_TIMEOUT_SECONDS}s. "
+            "Check that your embedding endpoint is reachable. "
+            "Set COGNEE_SKIP_CONNECTION_TEST=true to bypass this check."
+        )
+        logger.error(msg)
+        raise TimeoutError(msg)
     except Exception as e:
         logger.error(e)
         logger.error("Connection to Embedding handler could not be established.")

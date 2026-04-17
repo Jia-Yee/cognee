@@ -7,6 +7,10 @@ on:
         required: false
         type: string
         default: '3.11.x'
+      ci-image:
+        required: false
+        type: string
+        default: ''
     secrets:
       LLM_PROVIDER:
         required: true
@@ -33,6 +37,7 @@ jobs:
   run-relational-db-migration-test-networkx:
     name: NetworkX Relational DB Migration Test
     runs-on: ubuntu-22.04
+    container: ${{ inputs.ci-image != '' && fromJSON(format('{{"image":"{0}","credentials":{{"username":"{1}","password":"{2}"}}}}', inputs.ci-image, github.actor, github.token)) || null }}
     defaults:
       run:
         shell: bash
@@ -52,29 +57,30 @@ jobs:
           - 5432:5432
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Cognee Setup
         uses: ./.github/actions/cognee_setup
         with:
           python-version: '3.11.x'
+          extra-dependencies: "postgres"
 
       - name: Install specific db dependency
-        run: |
-          poetry install -E postgres
+        run: echo "Dependencies already installed in setup"
 
       - name: Run PostgreSQL Script to create test data (Chinook_PostgreSql.sql)
         env:
           PGPASSWORD: cognee
+          PG_HOST: ${{ inputs.ci-image != '' && 'postgres' || 'localhost' }}
         run: |
           # Wait until the PostgreSQL service is available
-          until pg_isready -h localhost -p 5432; do
+          until pg_isready -h $PG_HOST -p 5432; do
             echo "Waiting for postgres..."
             sleep 2
           done
 
           # Execute the SQL script against the test_migration_db database
-          psql -h localhost -U cognee -d test_migration_db -f ./cognee/tests/test_data/Chinook_PostgreSql.sql
+          psql -h $PG_HOST -U cognee -d test_migration_db -f ./cognee/tests/test_data/Chinook_PostgreSql.sql
 
       - name: Run relational db test
         env:
@@ -86,15 +92,18 @@ jobs:
           LLM_API_VERSION: ${{ secrets.LLM_API_VERSION }}
 
           EMBEDDING_PROVIDER: openai
+          EMBEDDING_DIMENSIONS: 300
           EMBEDDING_MODEL: ${{ secrets.EMBEDDING_MODEL }}
           EMBEDDING_ENDPOINT: ${{ secrets.EMBEDDING_ENDPOINT }}
           EMBEDDING_API_KEY: ${{ secrets.EMBEDDING_API_KEY }}
           EMBEDDING_API_VERSION: ${{ secrets.EMBEDDING_API_VERSION }}
-        run: poetry run python ./cognee/tests/test_relational_db_migration.py
+          DB_HOST: ${{ inputs.ci-image != '' && 'postgres' || '127.0.0.1' }}
+        run: uv run python ./cognee/tests/test_relational_db_migration.py
 
   run-relational-db-migration-test-kuzu:
     name: Kuzu Relational DB Migration Test
     runs-on: ubuntu-22.04
+    container: ${{ inputs.ci-image != '' && fromJSON(format('{{"image":"{0}","credentials":{{"username":"{1}","password":"{2}"}}}}', inputs.ci-image, github.actor, github.token)) || null }}
     defaults:
       run:
         shell: bash
@@ -114,29 +123,30 @@ jobs:
           - 5432:5432
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Cognee Setup
         uses: ./.github/actions/cognee_setup
         with:
           python-version: '3.11.x'
+          extra-dependencies: "postgres"
 
       - name: Install specific db dependency
-        run: |
-          poetry install -E postgres -E kuzu
+        run: echo "Dependencies already installed in setup"
 
       - name: Run PostgreSQL Script to create test data (Chinook_PostgreSql.sql)
         env:
           PGPASSWORD: cognee
+          PG_HOST: ${{ inputs.ci-image != '' && 'postgres' || 'localhost' }}
         run: |
           # Wait until the PostgreSQL service is available
-          until pg_isready -h localhost -p 5432; do
+          until pg_isready -h $PG_HOST -p 5432; do
             echo "Waiting for postgres..."
             sleep 2
           done
 
           # Execute the SQL script against the test_migration_db database
-          psql -h localhost -U cognee -d test_migration_db -f ./cognee/tests/test_data/Chinook_PostgreSql.sql
+          psql -h $PG_HOST -U cognee -d test_migration_db -f ./cognee/tests/test_data/Chinook_PostgreSql.sql
 
       - name: Run relational db test
         env:
@@ -150,11 +160,13 @@ jobs:
           LLM_API_VERSION: ${{ secrets.LLM_API_VERSION }}
 
           EMBEDDING_PROVIDER: openai
+          EMBEDDING_DIMENSIONS: 300
           EMBEDDING_MODEL: ${{ secrets.EMBEDDING_MODEL }}
           EMBEDDING_ENDPOINT: ${{ secrets.EMBEDDING_ENDPOINT }}
           EMBEDDING_API_KEY: ${{ secrets.EMBEDDING_API_KEY }}
           EMBEDDING_API_VERSION: ${{ secrets.EMBEDDING_API_VERSION }}
-        run: poetry run python ./cognee/tests/test_relational_db_migration.py
+          DB_HOST: ${{ inputs.ci-image != '' && 'postgres' || '127.0.0.1' }}
+        run: uv run python ./cognee/tests/test_relational_db_migration.py
 
   run-relational-db-migration-test-neo4j:
     name: Neo4j Relational DB Migration Test
@@ -178,16 +190,20 @@ jobs:
           - 5432:5432
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Cognee Setup
         uses: ./.github/actions/cognee_setup
         with:
           python-version: '3.11.x'
+          extra-dependencies: "postgres"
+
+      - name: Setup Neo4j with GDS
+        uses: ./.github/actions/setup_neo4j
+        id: neo4j
 
       - name: Install specific db dependency
-        run: |
-          poetry install -E postgres -E neo4j
+        run: echo "Dependencies already installed in setup"
 
       - name: Run PostgreSQL Script to create test data (Chinook_PostgreSql.sql)
         env:
@@ -206,9 +222,9 @@ jobs:
         env:
           ENV: 'dev'
           GRAPH_DATABASE_PROVIDER: "neo4j"
-          GRAPH_DATABASE_URL: ${{ secrets.NEO4J_API_URL }}
-          GRAPH_DATABASE_PASSWORD: ${{ secrets.NEO4J_API_KEY }}
-          GRAPH_DATABASE_USERNAME: "neo4j"
+          GRAPH_DATABASE_URL: ${{ steps.neo4j.outputs.neo4j-url }}
+          GRAPH_DATABASE_USERNAME: ${{ steps.neo4j.outputs.neo4j-username }}
+          GRAPH_DATABASE_PASSWORD: ${{ steps.neo4j.outputs.neo4j-password }}
 
           LLM_PROVIDER: openai
           LLM_MODEL: ${{ secrets.LLM_MODEL }}
@@ -217,8 +233,9 @@ jobs:
           LLM_API_VERSION: ${{ secrets.LLM_API_VERSION }}
 
           EMBEDDING_PROVIDER: openai
+          EMBEDDING_DIMENSIONS: 300
           EMBEDDING_MODEL: ${{ secrets.EMBEDDING_MODEL }}
           EMBEDDING_ENDPOINT: ${{ secrets.EMBEDDING_ENDPOINT }}
           EMBEDDING_API_KEY: ${{ secrets.EMBEDDING_API_KEY }}
           EMBEDDING_API_VERSION: ${{ secrets.EMBEDDING_API_VERSION }}
-        run: poetry run python ./cognee/tests/test_relational_db_migration.py
+        run: uv run python ./cognee/tests/test_relational_db_migration.py

@@ -7,11 +7,11 @@ on:
         required: false
         type: string
         default: '3.11.x'
+      ci-image:
+        required: false
+        type: string
+        default: ''
     secrets:
-      GRAPHISTRY_USERNAME:
-        required: true
-      GRAPHISTRY_PASSWORD:
-        required: true
       LLM_PROVIDER:
         required: true
       LLM_MODEL:
@@ -38,47 +38,12 @@ env:
   ENV: 'dev'
 
 jobs:
-
-  lint:
-    name: Run Linting
-    runs-on: ubuntu-22.04
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Cognee Setup
-        uses: ./.github/actions/cognee_setup
-        with:
-          python-version: ${{ inputs.python-version }}
-
-      - name: Run Linting
-        uses: astral-sh/ruff-action@v2
-
-  format-check:
-    name: Run Formatting Check
-    runs-on: ubuntu-22.04
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Cognee Setup
-        uses: ./.github/actions/cognee_setup
-        with:
-          python-version: ${{ inputs.python-version }}
-
-      - name: Run Formatting Check
-        uses: astral-sh/ruff-action@v2
-        with:
-          args: "format --check"
-
   unit-tests:
     name: Run Unit Tests
     runs-on: ubuntu-22.04
+    container: ${{ inputs.ci-image != '' && fromJSON(format('{{"image":"{0}","credentials":{{"username":"{1}","password":"{2}"}}}}', inputs.ci-image, github.actor, github.token)) || null }}
     env:
+      ENV: 'dev'
       LLM_PROVIDER: openai
       LLM_MODEL: ${{ secrets.LLM_MODEL }}
       LLM_ENDPOINT: ${{ secrets.LLM_ENDPOINT }}
@@ -88,11 +53,12 @@ jobs:
       EMBEDDING_PROVIDER: openai
       EMBEDDING_MODEL: ${{ secrets.EMBEDDING_MODEL }}
       EMBEDDING_ENDPOINT: ${{ secrets.EMBEDDING_ENDPOINT }}
+      EMBEDDING_DIMENSIONS: 300
       EMBEDDING_API_KEY: ${{ secrets.EMBEDDING_API_KEY }}
       EMBEDDING_API_VERSION: ${{ secrets.EMBEDDING_API_VERSION }}
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
@@ -102,32 +68,14 @@ jobs:
           python-version: ${{ inputs.python-version }}
 
       - name: Run Unit Tests
-        run: poetry run pytest cognee/tests/unit/
-
-  integration-tests:
-    name: Run Integration Tests
-    runs-on: ubuntu-22.04
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Cognee Setup
-        uses: ./.github/actions/cognee_setup
-        with:
-          python-version: ${{ inputs.python-version }}
-
-      - name: Run Integration Tests
-        run: poetry run pytest cognee/tests/integration/
+        run: uv run pytest cognee/tests/unit/
 
   simple-examples:
     name: Run Simple Examples
     runs-on: ubuntu-22.04
+    container: ${{ inputs.ci-image != '' && fromJSON(format('{{"image":"{0}","credentials":{{"username":"{1}","password":"{2}"}}}}', inputs.ci-image, github.actor, github.token)) || null }}
     env:
-      GRAPHISTRY_USERNAME: ${{ secrets.GRAPHISTRY_USERNAME }}
-      GRAPHISTRY_PASSWORD: ${{ secrets.GRAPHISTRY_PASSWORD }}
-
+      ENV: 'dev'
       LLM_PROVIDER: openai
       LLM_MODEL: ${{ secrets.LLM_MODEL }}
       LLM_ENDPOINT: ${{ secrets.LLM_ENDPOINT }}
@@ -135,13 +83,14 @@ jobs:
       LLM_API_VERSION: ${{ secrets.LLM_API_VERSION }}
 
       EMBEDDING_PROVIDER: openai
+      EMBEDDING_DIMENSIONS: 300
       EMBEDDING_MODEL: ${{ secrets.EMBEDDING_MODEL }}
       EMBEDDING_ENDPOINT: ${{ secrets.EMBEDDING_ENDPOINT }}
       EMBEDDING_API_KEY: ${{ secrets.EMBEDDING_API_KEY }}
       EMBEDDING_API_VERSION: ${{ secrets.EMBEDDING_API_VERSION }}
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
@@ -151,14 +100,20 @@ jobs:
           python-version: ${{ inputs.python-version }}
 
       - name: Run Simple Examples
-        run: poetry run python ./examples/python/simple_example.py
+        run: uv run python ./examples/demos/simple_cognee_example.py
 
-  graph-tests:
-    name: Run Basic Graph Tests
+  simple-examples-baml:
+    name: Run Simple Examples BAML
     runs-on: ubuntu-22.04
+    container: ${{ inputs.ci-image != '' && fromJSON(format('{{"image":"{0}","credentials":{{"username":"{1}","password":"{2}"}}}}', inputs.ci-image, github.actor, github.token)) || null }}
     env:
-      GRAPHISTRY_USERNAME: ${{ secrets.GRAPHISTRY_USERNAME }}
-      GRAPHISTRY_PASSWORD: ${{ secrets.GRAPHISTRY_PASSWORD }}
+      ENV: 'dev'
+      STRUCTURED_OUTPUT_FRAMEWORK: "BAML"
+      BAML_LLM_PROVIDER: openai
+      BAML_LLM_MODEL: ${{ secrets.OPENAI_MODEL }}
+      BAML_LLM_ENDPOINT: ${{ secrets.OPENAI_ENDPOINT }}
+      BAML_LLM_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+#      BAML_LLM_API_VERSION: ${{ secrets.LLM_API_VERSION }}
 
       LLM_PROVIDER: openai
       LLM_MODEL: ${{ secrets.LLM_MODEL }}
@@ -167,13 +122,14 @@ jobs:
       LLM_API_VERSION: ${{ secrets.LLM_API_VERSION }}
 
       EMBEDDING_PROVIDER: openai
+      EMBEDDING_DIMENSIONS: 300
       EMBEDDING_MODEL: ${{ secrets.EMBEDDING_MODEL }}
       EMBEDDING_ENDPOINT: ${{ secrets.EMBEDDING_ENDPOINT }}
       EMBEDDING_API_KEY: ${{ secrets.EMBEDDING_API_KEY }}
       EMBEDDING_API_VERSION: ${{ secrets.EMBEDDING_API_VERSION }}
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
@@ -181,6 +137,7 @@ jobs:
         uses: ./.github/actions/cognee_setup
         with:
           python-version: ${{ inputs.python-version }}
+          extra-dependencies: "baml"
 
-      - name: Run Graph Tests
-        run: poetry run python ./examples/python/code_graph_example.py --repo_path ./cognee/tasks/graph
+      - name: Run Simple Examples
+        run: uv run python ./examples/demos/simple_cognee_example.py

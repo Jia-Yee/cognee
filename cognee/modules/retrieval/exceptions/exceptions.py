@@ -1,8 +1,8 @@
 from fastapi import status
-from cognee.exceptions import CogneeApiError, CriticalError
+from cognee.exceptions import CogneeValidationError, CogneeSystemError
 
 
-class SearchTypeNotSupported(CogneeApiError):
+class SearchTypeNotSupported(CogneeValidationError):
     def __init__(
         self,
         message: str = "CYPHER search type not supported by the adapter.",
@@ -12,7 +12,7 @@ class SearchTypeNotSupported(CogneeApiError):
         super().__init__(message, name, status_code)
 
 
-class CypherSearchError(CogneeApiError):
+class CypherSearchError(CogneeSystemError):
     def __init__(
         self,
         message: str = "An error occurred during the execution of the Cypher query.",
@@ -22,5 +22,31 @@ class CypherSearchError(CogneeApiError):
         super().__init__(message, name, status_code)
 
 
-class NoDataError(CriticalError):
-    message: str = "No data found in the system, please add data first."
+class NoDataError(CogneeValidationError):
+    def __init__(
+        self,
+        message: str = "No data found in the system, please add data first.",
+        name: str = "NoDataError",
+        status_code: int = status.HTTP_404_NOT_FOUND,
+    ):
+        super().__init__(message, name, status_code)
+
+
+class CollectionDistancesNotFoundError(CogneeValidationError):
+    def __init__(
+        self,
+        message: str = "No collection distances found for the given query.",
+        name: str = "CollectionDistancesNotFoundError",
+        status_code: int = status.HTTP_404_NOT_FOUND,
+    ):
+        super().__init__(message, name, status_code)
+
+
+class QueryValidationError(CogneeValidationError):
+    def __init__(
+        self,
+        message: str = "Queries not supplied in the correct format.",
+        name: str = "QueryValidationError",
+        status_code: int = status.HTTP_422_UNPROCESSABLE_CONTENT,
+    ):
+        super().__init__(message, name, status_code)

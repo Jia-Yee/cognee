@@ -4,8 +4,6 @@ import asyncio
 from cognee.infrastructure.context.BaseContextProvider import BaseContextProvider
 from cognee.infrastructure.engine import DataPoint
 from cognee.modules.graph.cognee_graph.CogneeGraph import CogneeGraph
-from cognee.infrastructure.llm.get_llm_client import get_llm_client
-from cognee.infrastructure.llm.prompts import read_query_prompt
 from cognee.modules.retrieval.utils.brute_force_triplet_search import (
     brute_force_triplet_search,
     format_triplets,
@@ -44,7 +42,6 @@ class TripletSearchContextProvider(BaseContextProvider):
         self,
         entities: List[DataPoint],
         query: str,
-        user: User,
         memory_fragment: CogneeGraph,
     ) -> List:
         """Creates search tasks for valid entities."""
@@ -85,9 +82,8 @@ class TripletSearchContextProvider(BaseContextProvider):
         if not entities:
             return "No entities provided for context search."
 
-        user = await get_default_user()
         memory_fragment = await get_memory_fragment(self.properties_to_project)
-        search_tasks = self._get_search_tasks(entities, query, user, memory_fragment)
+        search_tasks = self._get_search_tasks(entities, query, memory_fragment)
 
         if not search_tasks:
             return "No valid entities found for context search."

@@ -59,7 +59,7 @@ async def handle_search(arguments: Dict[str, Any], user) -> list:
     valid_search_types = (
         search_tool["parameters"]["properties"]["search_type"]["enum"]
         if search_tool
-        else ["INSIGHTS", "CODE", "GRAPH_COMPLETION", "SEMANTIC", "NATURAL_LANGUAGE"]
+        else ["CODE", "GRAPH_COMPLETION", "NATURAL_LANGUAGE"]
     )
 
     if search_type_str not in valid_search_types:
@@ -88,11 +88,16 @@ async def handle_cognify(arguments: Dict[str, Any], user) -> str:
     """Handle cognify function call"""
     text = arguments.get("text")
     ontology_file_path = arguments.get("ontology_file_path")
+    custom_prompt = arguments.get("custom_prompt")
 
     if text:
         await add(data=text, user=user)
 
-    await cognify(user=user, ontology_file_path=ontology_file_path if ontology_file_path else None)
+    await cognify(
+        user=user,
+        ontology_file_path=ontology_file_path if ontology_file_path else None,
+        custom_prompt=custom_prompt,
+    )
 
     return (
         "Text successfully converted into knowledge graph."

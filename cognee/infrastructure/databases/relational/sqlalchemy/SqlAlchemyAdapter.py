@@ -1,17 +1,22 @@
 import os
+import asyncio
 from os import path
-from cognee.shared.logging_utils import get_logger
+import tempfile
 from uuid import UUID
 from typing import Optional
 from typing import AsyncGenerator, List
 from contextlib import asynccontextmanager
-from sqlalchemy import text, select, MetaData, Table, delete, inspect
 from sqlalchemy.orm import joinedload
 from sqlalchemy.exc import NoResultFound
+from sqlalchemy import NullPool, text, select, MetaData, Table, delete, inspect, func
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
 
-from cognee.infrastructure.databases.exceptions import EntityNotFoundError
 from cognee.modules.data.models.Data import Data
+from cognee.modules.data.models.DatasetData import DatasetData
+from cognee.shared.logging_utils import get_logger
+from cognee.infrastructure.utils.run_sync import run_sync
+from cognee.infrastructure.databases.exceptions import EntityNotFoundError
+from cognee.infrastructure.files.storage import get_file_storage, get_storage_config
 
 from ..ModelBase import Base
 
@@ -25,15 +30,99 @@ class SQLAlchemyAdapter:
     functions.
     """
 
-    def __init__(self, connection_string: str):
+    def __init__(self, connection_string: str, connect_args: dict = None, pool_args: dict = None):
+        """
+        Initialize the SQLAlchemy adapter with connection settings.
+
+        Parameters:
+        -----------
+            connection_string (str): The database connection string (e.g., 'sqlite:///path/to/db'
+                or 'postgresql://user:pass@host:port/db').
+            connect_args (dict, optional): Database driver connection arguments.
+                Configuration is loaded from RelationalConfig.database_connect_args, which reads
+                from the DATABASE_CONNECT_ARGS environment variable.
+
+                Examples:
+                    PostgreSQL with SSL:
+                        DATABASE_CONNECT_ARGS='{"sslmode": "require", "connect_timeout": 10}'
+
+                    SQLite with custom timeout:
+                        DATABASE_CONNECT_ARGS='{"timeout": 60}'
+        """
         self.db_path: str = None
         self.db_uri: str = connection_string
 
-        self.engine = create_async_engine(connection_string)
+        # Use provided connect_args (already parsed from config)
+        final_connect_args = connect_args or {}
+
+        if "sqlite" in connection_string:
+            [prefix, db_path] = connection_string.split("///")
+            self.db_path = db_path
+
+            if "s3://" in self.db_path:
+                db_dir_path = path.dirname(self.db_path)
+                file_storage = get_file_storage(db_dir_path)
+
+                run_sync(file_storage.ensure_directory_exists())
+
+                with tempfile.NamedTemporaryFile(mode="w", delete=False) as temp_file:
+                    self.temp_db_file = temp_file.name
+                    connection_string = prefix + "///" + self.temp_db_file
+
+                run_sync(self.pull_from_s3())
+
+        if "sqlite" in connection_string:
+            self.engine = create_async_engine(
+                connection_string,
+                poolclass=NullPool,
+                connect_args={**{"timeout": 30}, **final_connect_args},
+            )
+        else:
+            # Transform pool_args from tuple into dict if provided
+            # Note: For caching purposes, pool_args is stored as a sorted tuple of key-value pairs in the config
+            pool_args = pool_args or {}
+
+            if pool_args.get("pool_size") is None:
+                pool_args["pool_size"] = 20
+
+            if pool_args.get("max_overflow") is None:
+                pool_args["max_overflow"] = 20
+
+            if pool_args.get("pool_pre_ping") is None:
+                pool_args["pool_pre_ping"] = True
+
+            if pool_args.get("pool_recycle") is None:
+                pool_args["pool_recycle"] = 280
+
+            if pool_args.get("pool_timeout") is None:
+                pool_args["pool_timeout"] = 280
+
+            engine_kwargs = {**pool_args}
+            if final_connect_args:
+                engine_kwargs["connect_args"] = final_connect_args
+
+            self.engine = create_async_engine(
+                connection_string,
+                **engine_kwargs,
+            )
+
         self.sessionmaker = async_sessionmaker(bind=self.engine, expire_on_commit=False)
 
-        if self.engine.dialect.name == "sqlite":
-            self.db_path = connection_string.split("///")[1]
+    async def push_to_s3(self) -> None:
+        if os.getenv("STORAGE_BACKEND", "").lower() == "s3" and hasattr(self, "temp_db_file"):
+            from cognee.infrastructure.files.storage.S3FileStorage import S3FileStorage
+
+            s3_file_storage = S3FileStorage("")
+            s3_file_storage.s3.put(self.temp_db_file, self.db_path, recursive=True)
+
+    async def pull_from_s3(self) -> None:
+        from cognee.infrastructure.files.storage.S3FileStorage import S3FileStorage
+
+        s3_file_storage = S3FileStorage("")
+        try:
+            s3_file_storage.s3.get(self.db_path, self.temp_db_file, recursive=True)
+        except FileNotFoundError:
+            pass
 
     @asynccontextmanager
     async def get_async_session(self) -> AsyncGenerator[AsyncSession, None]:
@@ -217,7 +306,7 @@ class SQLAlchemyAdapter:
                 await session.execute(TableModel.delete().where(TableModel.c.id == data_id))
                 await session.commit()
 
-    async def delete_data_entity(self, data_id: UUID):
+    async def delete_data_entity(self, data_id: UUID, dataset_id: UUID):
         """
         Delete a data entity along with its local files if no references remain in the database.
 
@@ -232,10 +321,34 @@ class SQLAlchemyAdapter:
                 # so must be enabled for each database connection/session separately.
                 await session.execute(text("PRAGMA foreign_keys = ON;"))
 
+            # Delete DatasetData instances referencing this data_id first to maintain referential integrity.
+            await session.execute(
+                delete(DatasetData).where(
+                    DatasetData.data_id == data_id,
+                    DatasetData.dataset_id == dataset_id,
+                )
+            )
+            # Flush to ensure the count in the next step is accurate within the transaction
+            await session.flush()
+
+            # Check if any references to this data_id still exist in the DatasetData table
+            remaining_refs = (
+                await session.execute(
+                    select(func.count())
+                    .select_from(DatasetData)
+                    .where(DatasetData.data_id == data_id)
+                )
+            ).scalar()
+
+            # If there are still datasets using this data, we stop here.
+            if remaining_refs > 0:
+                await session.commit()
+                return
+
             try:
                 data_entity = (await session.scalars(select(Data).where(Data.id == data_id))).one()
             except (ValueError, NoResultFound) as e:
-                raise EntityNotFoundError(message=f"Entity not found: {str(e)}")
+                raise EntityNotFoundError(message=f"Entity not found: {str(e)}") from e
 
             # Check if other data objects point to the same raw data location
             raw_data_location_entities = (
@@ -249,13 +362,18 @@ class SQLAlchemyAdapter:
             # Don't delete local file unless this is the only reference to the file in the database
             if len(raw_data_location_entities) == 1:
                 # delete local file only if it's created by cognee
-                from cognee.base_config import get_base_config
+                storage_config = get_storage_config()
 
-                config = get_base_config()
+                if (
+                    storage_config["data_root_directory"]
+                    in raw_data_location_entities[0].raw_data_location
+                ):
+                    file_storage = get_file_storage(storage_config["data_root_directory"])
 
-                if config.data_root_directory in raw_data_location_entities[0].raw_data_location:
-                    if os.path.exists(raw_data_location_entities[0].raw_data_location):
-                        os.remove(raw_data_location_entities[0].raw_data_location)
+                    file_path = os.path.basename(raw_data_location_entities[0].raw_data_location)
+
+                    if await file_storage.file_exists(file_path):
+                        await file_storage.remove(file_path)
                     else:
                         # Report bug as file should exist
                         logger.error("Local file which should exist can't be found.")
@@ -293,7 +411,10 @@ class SQLAlchemyAdapter:
                 # Load table information from schema into MetaData
                 await connection.run_sync(metadata.reflect, schema=schema_name)
                 # Define the full table name
-                full_table_name = f"{schema_name}.{table_name}"
+                if schema_name is None:
+                    full_table_name = table_name
+                else:
+                    full_table_name = f"{schema_name}.{table_name}"
                 # Check if table is in list of tables for the given schema
                 if full_table_name in metadata.tables:
                     return metadata.tables[full_table_name]
@@ -434,13 +555,24 @@ class SQLAlchemyAdapter:
         Create the database if it does not exist, ensuring necessary directories are in place
         for SQLite.
         """
-        if self.engine.dialect.name == "sqlite" and not os.path.exists(self.db_path):
-            from cognee.infrastructure.files.storage import LocalStorage
-
+        if self.engine.dialect.name == "sqlite":
             db_directory = path.dirname(self.db_path)
-            LocalStorage.ensure_directory_exists(db_directory)
+            db_name = path.basename(self.db_path)
+            file_storage = get_file_storage(db_directory)
+
+            if not await file_storage.file_exists(db_name):
+                await file_storage.ensure_directory_exists()
 
         async with self.engine.begin() as connection:
+            # Import here to avoid circular imports
+            from cognee.infrastructure.databases.vector.config import get_vectordb_config
+
+            vector_config = get_vectordb_config()
+            if (
+                vector_config.vector_db_provider == "pgvector"
+                and self.engine.dialect.name == "postgresql"
+            ):
+                await connection.execute(text("CREATE EXTENSION IF NOT EXISTS vector;"))
             if len(Base.metadata.tables.keys()) > 0:
                 await connection.run_sync(Base.metadata.create_all)
 
@@ -450,11 +582,13 @@ class SQLAlchemyAdapter:
         """
         try:
             if self.engine.dialect.name == "sqlite":
-                from cognee.infrastructure.files.storage import LocalStorage
-
                 await self.engine.dispose(close=True)
-                with open(self.db_path, "w") as file:
-                    file.write("")
+                # Wait for the database connections to close and release the file (Windows)
+                await asyncio.sleep(2)
+                db_directory = path.dirname(self.db_path)
+                file_name = path.basename(self.db_path)
+                file_storage = get_file_storage(db_directory)
+                await file_storage.remove(file_name)
             else:
                 async with self.engine.begin() as connection:
                     # Create a MetaData instance to load table information
@@ -470,6 +604,7 @@ class SQLAlchemyAdapter:
                             )
                             await connection.execute(drop_table_query)
                         metadata.clear()
+
         except Exception as e:
             logger.error(f"Error deleting database: {e}")
             raise e

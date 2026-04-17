@@ -1,12 +1,15 @@
-from uuid import UUID as uuid_UUID
 from typing import Optional
+from uuid import UUID as uuid_UUID
+from fastapi_users import schemas
+from fastapi_users.db import SQLAlchemyBaseUserTableUUID
 from sqlalchemy import ForeignKey, Column, UUID
 from sqlalchemy.orm import relationship, Mapped
-from fastapi_users.db import SQLAlchemyBaseUserTableUUID
+
 from .Principal import Principal
+from .UserTenant import UserTenant
 from .UserRole import UserRole
 from .Role import Role
-from fastapi_users import schemas
+from .Tenant import Tenant
 
 
 class User(SQLAlchemyBaseUserTableUUID, Principal):
@@ -14,7 +17,7 @@ class User(SQLAlchemyBaseUserTableUUID, Principal):
 
     id = Column(UUID, ForeignKey("principals.id", ondelete="CASCADE"), primary_key=True)
 
-    # Foreign key to Tenant (Many-to-One relationship)
+    # Foreign key to current Tenant (Many-to-One relationship)
     tenant_id = Column(UUID, ForeignKey("tenants.id"))
 
     # Many-to-Many Relationship with Roles
@@ -24,11 +27,11 @@ class User(SQLAlchemyBaseUserTableUUID, Principal):
         back_populates="users",
     )
 
-    # Relationship to Tenant
-    tenant = relationship(
+    # Many-to-Many Relationship with Tenants user is a part of
+    tenants: Mapped[list["Tenant"]] = relationship(
         "Tenant",
+        secondary=UserTenant.__tablename__,
         back_populates="users",
-        foreign_keys=[tenant_id],
     )
 
     # ACL Relationship (One-to-Many)
@@ -45,7 +48,7 @@ class UserRead(schemas.BaseUser[uuid_UUID]):
 
 
 class UserCreate(schemas.BaseUserCreate):
-    tenant_id: Optional[uuid_UUID] = None
+    is_verified: bool = True
 
 
 class UserUpdate(schemas.BaseUserUpdate):

@@ -1,5 +1,5 @@
 import asyncio
-from cognee.shared.logging_utils import get_logger, ERROR
+from cognee.shared.logging_utils import get_logger, setup_logging, ERROR
 
 from typing import List
 from cognee.infrastructure.databases.graph import get_graph_engine
@@ -9,7 +9,7 @@ from cognee.modules.users.methods import get_default_user
 from cognee.modules.users.models import User
 from cognee.shared.utils import send_telemetry
 from cognee.modules.search.methods import search
-from cognee.infrastructure.llm.get_llm_client import get_llm_client
+from cognee.infrastructure.llm.LLMGateway import LLMGateway
 
 logger = get_logger(level=ERROR)
 
@@ -62,7 +62,7 @@ async def code_description_to_code_part(
 
     try:
         if include_docs:
-            search_results = await search(query_text=query, query_type="INSIGHTS")
+            search_results = await search(query_text=query, query_type="GRAPH_COMPLETION")
 
             concatenated_descriptions = " ".join(
                 obj["description"]
@@ -71,8 +71,7 @@ async def code_description_to_code_part(
                 if isinstance(obj, dict) and "description" in obj
             )
 
-            llm_client = get_llm_client()
-            context_from_documents = await llm_client.acreate_structured_output(
+            context_from_documents = await LLMGateway.acreate_structured_output(
                 text_input=f"The retrieved context from documents is {concatenated_descriptions}.",
                 system_prompt="You are a Senior Software Engineer, summarize the context from documents"
                 f" in a way that it is gonna be provided next to codeparts as context"
@@ -144,6 +143,7 @@ async def code_description_to_code_part(
 
 
 if __name__ == "__main__":
+    logger = setup_logging(log_level=ERROR)
 
     async def main():
         query = "I am looking for a class with blue eyes"

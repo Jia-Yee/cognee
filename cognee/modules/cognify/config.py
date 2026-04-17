@@ -8,12 +8,16 @@ import os
 class CognifyConfig(BaseSettings):
     classification_model: object = DefaultContentPrediction
     summarization_model: object = SummarizedContent
+    triplet_embedding: bool = False
+    chunks_per_batch: Optional[int] = None
     model_config = SettingsConfigDict(env_file=".env", extra="allow")
 
     def to_dict(self) -> dict:
         return {
             "classification_model": self.classification_model,
             "summarization_model": self.summarization_model,
+            "triplet_embedding": self.triplet_embedding,
+            "chunks_per_batch": self.chunks_per_batch,
         }
 
 

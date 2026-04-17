@@ -1,15 +1,36 @@
-from cognee.tests.unit.interfaces.graph.get_graph_from_model_test import (
-    Document,
-    DocumentChunk,
-    Entity,
-    EntityType,
-)
+from typing import List
+from cognee.infrastructure.engine import DataPoint
 from cognee.tasks.storage.add_data_points import add_data_points
-from cognee.infrastructure.databases.graph.get_graph_engine import create_graph_engine
 import cognee
 from cognee.infrastructure.databases.graph import get_graph_engine
 import json
 from pathlib import Path
+
+
+class Document(DataPoint):
+    path: str
+    metadata: dict = {"index_fields": []}
+
+
+class DocumentChunk(DataPoint):
+    part_of: Document
+    text: str
+    contains: List["Entity"] = None
+    metadata: dict = {"index_fields": ["text"]}
+
+
+class EntityType(DataPoint):
+    name: str
+    metadata: dict = {"index_fields": ["name"]}
+
+
+class Entity(DataPoint):
+    name: str
+    is_type: EntityType
+    metadata: dict = {"index_fields": ["name"]}
+
+
+DocumentChunk.model_rebuild()
 
 
 async def create_disconnected_test_graph():
@@ -42,7 +63,6 @@ async def create_connected_test_graph():
 
 
 async def get_metrics(provider: str, include_optional=True):
-    create_graph_engine.cache_clear()
     cognee.config.set_graph_database_provider(provider)
     graph_engine = await get_graph_engine()
     await graph_engine.delete_graph()

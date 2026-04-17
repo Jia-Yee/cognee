@@ -2,49 +2,82 @@
 
 from functools import lru_cache
 
-
-from .config import get_graph_config
+from .config import get_graph_context_config
 from .graph_db_interface import GraphDBInterface
 from .supported_databases import supported_databases
 
 
 async def get_graph_engine() -> GraphDBInterface:
-    """
-    Factory function to get the appropriate graph client based on the graph type.
+    """Factory function to get the appropriate graph client based on the graph type."""
+    # Get appropriate graph configuration based on current async context
+    config = get_graph_context_config()
 
-    This function retrieves the graph configuration and creates a graph engine by calling
-    the `create_graph_engine` function. If the configured graph database provider is
-    'networkx', it ensures that the graph is loaded from a file asynchronously if it hasn't
-    been loaded yet. It raises an `EnvironmentError` if the necessary configurations for the
-    selected graph provider are missing.
-
-    Returns:
-    --------
-
-        - GraphDBInterface: Returns an instance of GraphDBInterface which represents the
-          selected graph client.
-    """
-    config = get_graph_config()
-
-    graph_client = create_graph_engine(**get_graph_config().to_hashable_dict())
+    graph_client = create_graph_engine(**config)
 
     # Async functions can't be cached. After creating and caching the graph engine
     # handle all necessary async operations for different graph types bellow.
-    # Handle loading of graph for NetworkX
-    if config.graph_database_provider.lower() == "networkx" and graph_client.graph is None:
-        await graph_client.load_graph_from_file()
+
+    # Run any adapter‐specific async initialization
+    if hasattr(graph_client, "initialize"):
+        await graph_client.initialize()
 
     return graph_client
 
 
-@lru_cache
 def create_graph_engine(
     graph_database_provider,
-    graph_database_url,
-    graph_database_username,
-    graph_database_password,
-    graph_database_port,
     graph_file_path,
+    graph_database_url="",
+    graph_database_name="",
+    graph_database_username="",
+    graph_database_password="",
+    graph_database_allow_anonymous=False,
+    graph_database_port="",
+    graph_database_key="",
+    graph_dataset_database_handler="",
+):
+    """
+    Wrapper function to call create graph engine with caching.
+    For a detailed description, see _create_graph_engine.
+    """
+    # Check USE_UNIFIED_PROVIDER outside the cache so it's always re-read
+    import os
+
+    unified_provider = os.environ.get("USE_UNIFIED_PROVIDER", "")
+    if unified_provider == "pghybrid":
+        from .postgres.adapter import PostgresAdapter
+        from cognee.infrastructure.databases.relational.get_relational_engine import (
+            get_relational_engine,
+        )
+
+        return PostgresAdapter(connection_string=get_relational_engine().db_uri)
+
+    return _create_graph_engine(
+        graph_database_provider,
+        graph_file_path,
+        graph_database_url,
+        graph_database_name,
+        graph_database_username,
+        graph_database_password,
+        graph_database_allow_anonymous,
+        graph_database_port,
+        graph_database_key,
+        graph_dataset_database_handler,
+    )
+
+
+@lru_cache
+def _create_graph_engine(
+    graph_database_provider,
+    graph_file_path,
+    graph_database_url="",
+    graph_database_name="",
+    graph_database_username="",
+    graph_database_password="",
+    graph_database_allow_anonymous=False,
+    graph_database_port="",
+    graph_database_key="",
+    graph_dataset_database_handler="",
 ):
     """
     Create a graph engine based on the specified provider type.
@@ -56,16 +89,14 @@ def create_graph_engine(
     Parameters:
     -----------
 
-        - graph_database_provider: The type of graph database provider to use (e.g., neo4j,
-          falkordb, kuzu, memgraph).
-        - graph_database_url: The URL for the graph database instance. Required for neo4j,
-          falkordb, and memgraph providers.
+        - graph_database_provider: The type of graph database provider to use (e.g., neo4j, falkor, kuzu).
+        - graph_database_url: The URL for the graph database instance. Required for neo4j and falkordb providers.
         - graph_database_username: The username for authentication with the graph database.
-          Required for neo4j and memgraph providers.
+          Required for neo4j provider.
         - graph_database_password: The password for authentication with the graph database.
-          Required for neo4j and memgraph providers.
+          Required for neo4j provider.
         - graph_database_port: The port number for the graph database connection. Required
-          for the falkordb provider.
+          for the falkordb provider
         - graph_file_path: The filesystem path to the graph file. Required for the kuzu
           provider.
 
@@ -83,34 +114,32 @@ def create_graph_engine(
             graph_database_url=graph_database_url,
             graph_database_username=graph_database_username,
             graph_database_password=graph_database_password,
+            graph_database_port=graph_database_port,
+            graph_database_key=graph_database_key,
+            database_name=graph_database_name,
         )
 
     if graph_database_provider == "neo4j":
-        if not (graph_database_url and graph_database_username and graph_database_password):
-            raise EnvironmentError("Missing required Neo4j credentials.")
+        if not graph_database_url:
+            raise EnvironmentError("Missing required Neo4j URL.")
 
         from .neo4j_driver.adapter import Neo4jAdapter
 
         return Neo4jAdapter(
             graph_database_url=graph_database_url,
-            graph_database_username=graph_database_username,
-            graph_database_password=graph_database_password,
+            graph_database_username=graph_database_username or None,
+            graph_database_password=graph_database_password or None,
+            graph_database_name=graph_database_name or None,
+            graph_database_allow_anonymous=graph_database_allow_anonymous,
         )
 
-    elif graph_database_provider == "falkordb":
-        if not (graph_database_url and graph_database_port):
-            raise EnvironmentError("Missing required FalkorDB credentials.")
+    elif graph_database_provider == "postgres":
+        if not graph_database_url:
+            raise EnvironmentError("Missing required Postgres GRAPH_DATABASE_URL.")
 
-        from cognee.infrastructure.databases.vector.embeddings import get_embedding_engine
-        from cognee.infrastructure.databases.hybrid.falkordb.FalkorDBAdapter import FalkorDBAdapter
+        from .postgres.adapter import PostgresAdapter
 
-        embedding_engine = get_embedding_engine()
-
-        return FalkorDBAdapter(
-            database_url=graph_database_url,
-            database_port=graph_database_port,
-            embedding_engine=embedding_engine,
-        )
+        return PostgresAdapter(connection_string=graph_database_url)
 
     elif graph_database_provider == "kuzu":
         if not graph_file_path:
@@ -120,20 +149,83 @@ def create_graph_engine(
 
         return KuzuAdapter(db_path=graph_file_path)
 
-    elif graph_database_provider == "memgraph":
-        if not (graph_database_url and graph_database_username and graph_database_password):
-            raise EnvironmentError("Missing required Memgraph credentials.")
+    elif graph_database_provider == "kuzu-remote":
+        if not graph_database_url:
+            raise EnvironmentError("Missing required Kuzu remote URL.")
 
-        from .memgraph.memgraph_adapter import MemgraphAdapter
+        from .kuzu.remote_kuzu_adapter import RemoteKuzuAdapter
 
-        return MemgraphAdapter(
-            graph_database_url=graph_database_url,
-            graph_database_username=graph_database_username,
-            graph_database_password=graph_database_password,
+        return RemoteKuzuAdapter(
+            api_url=graph_database_url,
+            username=graph_database_username,
+            password=graph_database_password,
+        )
+    elif graph_database_provider == "neptune":
+        try:
+            from langchain_aws import NeptuneAnalyticsGraph
+        except ImportError:
+            raise ImportError(
+                "langchain_aws is not installed. Please install it with 'pip install langchain_aws'"
+            )
+
+        if not graph_database_url:
+            raise EnvironmentError("Missing Neptune endpoint.")
+
+        from .neptune_driver.adapter import NeptuneGraphDB, NEPTUNE_ENDPOINT_URL
+
+        if not graph_database_url.startswith(NEPTUNE_ENDPOINT_URL):
+            raise ValueError(
+                f"Neptune endpoint must have the format {NEPTUNE_ENDPOINT_URL}<GRAPH_ID>"
+            )
+
+        graph_identifier = graph_database_url.replace(NEPTUNE_ENDPOINT_URL, "")
+
+        return NeptuneGraphDB(
+            graph_id=graph_identifier,
         )
 
-    from .networkx.adapter import NetworkXAdapter
+    elif graph_database_provider == "neptune_analytics":
+        """
+        Creates a graph DB from config
+        We want to use a hybrid (graph & vector) DB and we should update this
+        to make a single instance of the hybrid configuration (with embedder)
+        instead of creating the hybrid object twice.
+        """
+        try:
+            from langchain_aws import NeptuneAnalyticsGraph
+        except ImportError:
+            raise ImportError(
+                "langchain_aws is not installed. Please install it with 'pip install langchain_aws'"
+            )
 
-    graph_client = NetworkXAdapter(filename=graph_file_path)
+        if not graph_database_url:
+            raise EnvironmentError("Missing Neptune endpoint.")
 
-    return graph_client
+        from ..hybrid.neptune_analytics.NeptuneAnalyticsAdapter import (
+            NeptuneAnalyticsAdapter,
+            NEPTUNE_ANALYTICS_ENDPOINT_URL,
+        )
+
+        if not graph_database_url.startswith(NEPTUNE_ANALYTICS_ENDPOINT_URL):
+            raise ValueError(
+                f"Neptune endpoint must have the format '{NEPTUNE_ANALYTICS_ENDPOINT_URL}<GRAPH_ID>'"
+            )
+
+        graph_identifier = graph_database_url.replace(NEPTUNE_ANALYTICS_ENDPOINT_URL, "")
+
+        return NeptuneAnalyticsAdapter(
+            graph_id=graph_identifier,
+        )
+
+    all_providers = list(supported_databases.keys()) + [
+        "neo4j",
+        "kuzu",
+        "kuzu-remote",
+        "postgres",
+        "neptune",
+        "neptune_analytics",
+    ]
+    raise EnvironmentError(
+        f"Unsupported graph database provider: {graph_database_provider}. "
+        f"Supported providers are: {', '.join(all_providers)}"
+    )
